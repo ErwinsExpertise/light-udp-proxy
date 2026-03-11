@@ -1,6 +1,7 @@
 package frontend_test
 
 import (
+"fmt"
 "log/slog"
 "net"
 "os"
@@ -27,6 +28,7 @@ if err != nil {
 t.Fatalf("NewPool: %v", err)
 }
 sessions := session.NewTable(30*time.Second, 10*time.Second)
+t.Cleanup(sessions.Stop)
 counters := &metrics.Counters{}
 fcfg := config.FrontendConfig{
 Name:    t.Name(),
@@ -52,7 +54,7 @@ t.Error("Stop() timed out")
 }
 
 func TestFrontendForwardsPacket(t *testing.T) {
-// Start a UDP echo server.
+// Start a UDP sink that echoes packets back to the sender.
 echoConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
 if err != nil {
 t.Fatalf("echo listen: %v", err)
@@ -75,16 +77,57 @@ t.Fatalf("Start: %v", err)
 }
 defer fe.Stop()
 
+// Give goroutines a moment to be scheduled.
 time.Sleep(50 * time.Millisecond)
-if counters.PacketsReceived.Load() != 0 {
-t.Error("expected 0 packets received initially")
+
+// Dial the frontend and send a packet.
+clientConn, err := net.Dial("udp", fe.Addr())
+if err != nil {
+t.Fatalf("client dial: %v", err)
+}
+defer clientConn.Close()
+
+payload := []byte("hello-udp-proxy")
+if _, err := clientConn.Write(payload); err != nil {
+t.Fatalf("client write: %v", err)
+}
+
+// Poll for the counter to be updated (the worker is asynchronous).
+deadline := time.Now().Add(2 * time.Second)
+for time.Now().Before(deadline) {
+if counters.PacketsReceived.Load() > 0 {
+break
+}
+time.Sleep(10 * time.Millisecond)
+}
+if counters.PacketsReceived.Load() == 0 {
+t.Error("PacketsReceived is 0 after sending a packet")
+}
+if counters.PacketsForwarded.Load() == 0 {
+t.Error("PacketsForwarded is 0 after sending a packet")
 }
 }
 
-func TestFrontendReusePortFallback(t *testing.T) {
-// Verify that ReusePort:true doesn't error on the test platform.
+func TestFrontendReusePortEphemeralPortRejected(t *testing.T) {
 fe, _ := newTestFrontend(t, "127.0.0.1:0", "127.0.0.1:9999")
 err := fe.Start(2, config.SocketConfig{ReusePort: true})
+if err == nil {
+fe.Stop()
+t.Fatal("expected error when using reuse_port with ephemeral port 0")
+}
+}
+
+func TestFrontendReusePortFixedPort(t *testing.T) {
+// Allocate a free port then release it so the frontend can bind it.
+l, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+if err != nil {
+t.Skip("cannot allocate test port")
+}
+port := l.LocalAddr().(*net.UDPAddr).Port
+l.Close()
+
+fe, _ := newTestFrontend(t, fmt.Sprintf("127.0.0.1:%d", port), "127.0.0.1:9999")
+err = fe.Start(2, config.SocketConfig{ReusePort: true})
 if err != nil {
 // On some CI environments SO_REUSEPORT may be restricted; skip rather than fail.
 t.Skipf("SO_REUSEPORT not available: %v", err)

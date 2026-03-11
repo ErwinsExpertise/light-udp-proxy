@@ -102,6 +102,10 @@ func (p *Proxy) start() error {
 			return statuses
 		})
 	}
+	// Feed active_sessions from the session table so the count is always accurate
+	// (incremented on create, decremented on eviction/deletion).
+	sessions := p.sessions
+	p.metrics.RegisterSessionCount(func() int64 { return sessions.Count() })
 	if err := p.metrics.Start(); err != nil {
 		return err
 	}
@@ -141,6 +145,9 @@ func (p *Proxy) stop() {
 	}
 	if p.metrics != nil {
 		p.metrics.Stop()
+	}
+	if p.sessions != nil {
+		p.sessions.Stop()
 	}
 	p.log.Info("proxy stopped")
 }

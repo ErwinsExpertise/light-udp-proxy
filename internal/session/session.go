@@ -2,9 +2,9 @@
 package session
 
 import (
-"hash/fnv"
 "net/netip"
 "sync"
+"sync/atomic"
 "time"
 )
 
@@ -21,10 +21,31 @@ FrontendName string
 // Session holds state for a single client session.
 type Session struct {
 mu          sync.Mutex
-BackendAddr string
+backendAddr string
+onEvict     func() // called when session is evicted or deleted
 LastSeen    time.Time
 PacketCount int64
 ByteCount   int64
+}
+
+// NewSession creates a Session targeting backendAddr.
+func NewSession(backendAddr string) *Session {
+return &Session{backendAddr: backendAddr}
+}
+
+// BackendAddr returns the current backend address under the session mutex.
+func (s *Session) BackendAddr() string {
+s.mu.Lock()
+defer s.mu.Unlock()
+return s.backendAddr
+}
+
+// UpdateServer atomically updates the backend address and the eviction callback.
+func (s *Session) UpdateServer(addr string, onEvict func()) {
+s.mu.Lock()
+s.backendAddr = addr
+s.onEvict = onEvict
+s.mu.Unlock()
 }
 
 // Touch updates the last-seen timestamp and packet/byte counters.
@@ -34,6 +55,17 @@ s.LastSeen = time.Now()
 s.PacketCount++
 s.ByteCount += bytes
 s.mu.Unlock()
+}
+
+// callEvict invokes the eviction callback if one is registered. Must be called
+// without holding s.mu.
+func (s *Session) callEvict() {
+s.mu.Lock()
+fn := s.onEvict
+s.mu.Unlock()
+if fn != nil {
+fn()
+}
 }
 
 // shard is a single stripe of the session table.
@@ -47,11 +79,18 @@ type Table struct {
 shards          [numShards]shard
 timeout         time.Duration
 cleanupInterval time.Duration
+count           atomic.Int64
+stopCh          chan struct{}
+stopOnce        sync.Once
 }
 
 // NewTable creates a Table with the given session timeout and cleanup interval.
 func NewTable(timeout, cleanupInterval time.Duration) *Table {
-t := &Table{timeout: timeout, cleanupInterval: cleanupInterval}
+t := &Table{
+timeout:         timeout,
+cleanupInterval: cleanupInterval,
+stopCh:          make(chan struct{}),
+}
 for i := range t.shards {
 t.shards[i].entries = make(map[Key]*Session)
 }
@@ -59,15 +98,37 @@ go t.reaper()
 return t
 }
 
-// shardFor returns the shard index for a key using FNV-1a.
+// Stop terminates the background reaper goroutine. Safe to call multiple times.
+func (t *Table) Stop() {
+t.stopOnce.Do(func() { close(t.stopCh) })
+}
+
+// shardFor returns the shard index for a key using an allocation-free inline
+// FNV-1a hash over the address, port, and frontend name bytes.
 func shardFor(key Key) uint32 {
-h := fnv.New32a()
+const (
+offset32 = 2166136261
+prime32  = 16777619
+)
+h := uint32(offset32)
+// Hash the 16-byte IP representation.
 ab := key.Addr.Addr().As16()
-h.Write(ab[:])
+for _, b := range ab {
+h ^= uint32(b)
+h *= prime32
+}
+// Hash the 2-byte port.
 port := key.Addr.Port()
-h.Write([]byte{byte(port >> 8), byte(port)})
-h.Write([]byte(key.FrontendName))
-return h.Sum32() % numShards
+h ^= uint32(port >> 8)
+h *= prime32
+h ^= uint32(port & 0xff)
+h *= prime32
+// Hash frontend name bytes without converting to []byte.
+for i := 0; i < len(key.FrontendName); i++ {
+h ^= uint32(key.FrontendName[i])
+h *= prime32
+}
+return h % numShards
 }
 
 // Get returns the existing session for key, or nil if not found.
@@ -100,44 +161,59 @@ if newSess == nil {
 return nil, false
 }
 newSess.LastSeen = time.Now()
-newSess.PacketCount = 1
+	newSess.LastSeen = time.Now()
+	// PacketCount starts at its zero value; Touch() counts the first packet,
+	// avoiding a double-count.
 
 s.mu.Lock()
-// Check again after acquiring write lock (double-checked locking).
+// Double-checked locking: another goroutine may have inserted while we held no lock.
 if existing, ok := s.entries[key]; ok {
 s.mu.Unlock()
 return existing, false
 }
 s.entries[key] = newSess
 s.mu.Unlock()
+
+t.count.Add(1)
 return newSess, true
 }
 
-// Delete removes the session for key.
+// Delete removes the session for key, calling its eviction callback if set.
 func (t *Table) Delete(key Key) {
 s := &t.shards[shardFor(key)]
 s.mu.Lock()
+sess, ok := s.entries[key]
+if ok {
 delete(s.entries, key)
+}
 s.mu.Unlock()
+if ok {
+t.count.Add(-1)
+sess.callEvict()
+}
 }
 
-// Len returns the total number of active sessions across all shards.
+// Len returns the number of active sessions in O(1) via an atomic counter.
 func (t *Table) Len() int {
-total := 0
-for i := range t.shards {
-t.shards[i].mu.RLock()
-total += len(t.shards[i].entries)
-t.shards[i].mu.RUnlock()
+return int(t.count.Load())
 }
-return total
+
+// Count returns the number of active sessions as int64.
+func (t *Table) Count() int64 {
+return t.count.Load()
 }
 
 // reaper runs at cleanupInterval and evicts expired sessions.
 func (t *Table) reaper() {
 ticker := time.NewTicker(t.cleanupInterval)
 defer ticker.Stop()
-for range ticker.C {
+for {
+select {
+case <-t.stopCh:
+return
+case <-ticker.C:
 t.evictExpired()
+}
 }
 }
 
@@ -152,6 +228,9 @@ expired := sess.LastSeen.Before(cutoff)
 sess.mu.Unlock()
 if expired {
 delete(s.entries, k)
+t.count.Add(-1)
+// Call eviction hook outside the shard lock to avoid deadlocks.
+go sess.callEvict()
 }
 }
 s.mu.Unlock()

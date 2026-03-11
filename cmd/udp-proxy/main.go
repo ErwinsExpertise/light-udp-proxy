@@ -8,9 +8,22 @@ import (
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/proxy"
 )
 
+// Build-time variables injected by GoReleaser via -ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "", "path to YAML configuration file")
+	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("udp-proxy %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
 
 	if *configPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: udp-proxy -config <config.yaml>")

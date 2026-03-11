@@ -18,15 +18,13 @@ type Config struct {
 
 // GlobalConfig contains global proxy settings.
 type GlobalConfig struct {
-	MaxPacketSize           int           `yaml:"max_packet_size"`
-	WorkerThreads           int           `yaml:"worker_threads"`
-	ReadBufferSize          int           `yaml:"read_buffer_size"`
-	WriteBufferSize         int           `yaml:"write_buffer_size"`
-	SessionTimeout          time.Duration `yaml:"session_timeout"`
-	SessionCleanupInterval  time.Duration `yaml:"session_cleanup_interval"`
-	LogLevel                string        `yaml:"log_level"`
-	MetricsAddr             string        `yaml:"metrics_addr"`
-	Socket                  SocketConfig  `yaml:"socket"`
+	MaxPacketSize          int           `yaml:"max_packet_size"`
+	WorkerThreads          int           `yaml:"worker_threads"`
+	SessionTimeout         time.Duration `yaml:"session_timeout"`
+	SessionCleanupInterval time.Duration `yaml:"session_cleanup_interval"`
+	LogLevel               string        `yaml:"log_level"`
+	MetricsAddr            string        `yaml:"metrics_addr"`
+	Socket                 SocketConfig  `yaml:"socket"`
 }
 
 // SocketConfig holds kernel-level socket tuning options.
@@ -46,10 +44,8 @@ type FrontendConfig struct {
 	Listen          string `yaml:"listen"`
 	Backend         string `yaml:"backend"`
 	SessionAffinity bool   `yaml:"session_affinity"`
-	// Optional rate limiting
-	RateLimit      int `yaml:"rate_limit"`       // packets per second per client, 0 = unlimited
-	MaxSessions    int `yaml:"max_sessions"`     // max concurrent sessions, 0 = unlimited
-	MaxPacketSize  int `yaml:"max_packet_size"`  // override global, 0 = use global
+	MaxSessions     int    `yaml:"max_sessions"`    // max concurrent sessions, 0 = unlimited
+	MaxPacketSize   int    `yaml:"max_packet_size"` // override global, 0 = use global
 }
 
 // BackendConfig defines a pool of servers.
@@ -80,12 +76,6 @@ func (c *Config) defaults() {
 	}
 	if c.Global.WorkerThreads <= 0 {
 		c.Global.WorkerThreads = 4
-	}
-	if c.Global.ReadBufferSize <= 0 {
-		c.Global.ReadBufferSize = 4 * 1024 * 1024
-	}
-	if c.Global.WriteBufferSize <= 0 {
-		c.Global.WriteBufferSize = 4 * 1024 * 1024
 	}
 	if c.Global.SessionTimeout <= 0 {
 		c.Global.SessionTimeout = 60 * time.Second

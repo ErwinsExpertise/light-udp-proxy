@@ -8,7 +8,6 @@ import (
 "net"
 "net/netip"
 "sync"
-"time"
 
 "github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
 "github.com/ErwinsExpertise/light-udp-proxy/internal/config"
@@ -100,6 +99,19 @@ if socketCfg.ReusePort && workerCount > 1 {
 numListeners = workerCount
 }
 
+// When SO_REUSEPORT is used with multiple listeners, binding to an ephemeral
+// port (port 0) would cause each socket to get a different random port, making
+// the frontend listen on multiple unrelated ports. Reject this combination.
+if numListeners > 1 {
+addr, err := net.ResolveUDPAddr("udp", f.cfg.Listen)
+if err != nil {
+return fmt.Errorf("frontend %q: invalid listen address %q: %w", f.cfg.Name, f.cfg.Listen, err)
+}
+if addr.Port == 0 {
+return fmt.Errorf("frontend %q: reuse_port with multiple workers requires a fixed port, not ephemeral port 0", f.cfg.Name)
+}
+}
+
 for i := 0; i < numListeners; i++ {
 pc, err := lc.ListenPacket(context.Background(), "udp", f.cfg.Listen)
 if err != nil {
@@ -166,6 +178,15 @@ f.log.Info("frontend stopped", "name", f.cfg.Name)
 // Name returns the frontend name.
 func (f *Frontend) Name() string { return f.cfg.Name }
 
+// Addr returns the local address the first listener is bound to.
+// Useful in tests where the OS assigns the port (":0").
+func (f *Frontend) Addr() string {
+if len(f.listenConns) > 0 {
+return f.listenConns[0].LocalAddr().String()
+}
+return ""
+}
+
 func (f *Frontend) closeListeners() {
 for _, c := range f.listenConns {
 c.Close()
@@ -214,10 +235,11 @@ f.bufPool.Put(bufPtr)
 continue
 }
 
-// Session cap: drop new-session packets once the limit is reached.
-if f.cfg.MaxSessions > 0 && f.sessions.Len() >= f.cfg.MaxSessions {
+// Session cap: only call Len() (O(1) atomic read) when we would
+// otherwise create a new session. For existing sessions, no check needed.
+if f.cfg.MaxSessions > 0 {
 key := session.Key{Addr: clientAddr, FrontendName: f.cfg.Name}
-if f.sessions.Get(key) == nil {
+if f.sessions.Get(key) == nil && f.sessions.Len() >= f.cfg.MaxSessions {
 f.counters.PacketsDropped.Add(1)
 f.bufPool.Put(bufPtr)
 continue
@@ -277,29 +299,40 @@ s, err := f.pool.Pick(clientIP)
 if err != nil {
 return nil
 }
-return &session.Session{
-BackendAddr: s.Address,
-LastSeen:    time.Now(),
-}
+return session.NewSession(s.Address)
 })
 if sess == nil {
 f.counters.PacketsDropped.Add(1)
 return
 }
+
 if created {
-f.counters.ActiveSessions.Add(1)
+// Wire connCount: increment the chosen server's active session count
+// and register a callback so it decrements on session eviction/deletion.
+if s := f.pool.ServerByAddr(sess.BackendAddr()); s != nil {
+s.IncrConns()
+sess.UpdateServer(s.Address, func() { s.DecrConns() })
 }
+}
+
 sess.Touch(int64(p.n))
 
-srv = f.serverByAddr(sess.BackendAddr)
+// Read BackendAddr under the session mutex to avoid data races.
+backendAddr := sess.BackendAddr()
+srv = f.pool.ServerByAddr(backendAddr)
 if srv == nil || !srv.Healthy.Load() {
-// Session server is gone; re-pick and update the sticky binding.
-newSrv, err := f.pool.Pick(p.clientAddr.Addr().String())
+// Session server went unhealthy; re-pick and update the sticky binding.
+newSrv, err := f.pool.Pick(clientIP)
 if err != nil {
 f.counters.PacketsDropped.Add(1)
 return
 }
-sess.BackendAddr = newSrv.Address
+// Transfer connCount from old server to new one.
+if srv != nil {
+srv.DecrConns()
+}
+newSrv.IncrConns()
+sess.UpdateServer(newSrv.Address, func() { newSrv.DecrConns() })
 srv = newSrv
 }
 } else {
@@ -323,11 +356,4 @@ f.counters.PacketsForwarded.Add(1)
 f.counters.BytesOut.Add(int64(p.n))
 }
 
-func (f *Frontend) serverByAddr(addr string) *backend.Server {
-for _, s := range f.pool.Servers() {
-if s.Address == addr {
-return s
-}
-}
-return nil
-}
+// unused import guard for time package (used in session.NewSession via LastSeen).

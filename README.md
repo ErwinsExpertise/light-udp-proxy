@@ -82,8 +82,6 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 |---|---|---|
 | `max_packet_size` | `65535` | Maximum UDP payload size in bytes |
 | `worker_threads` | `4` | Goroutines per frontend reading from the socket |
-| `read_buffer_size` | `4194304` | OS socket read buffer (bytes) |
-| `write_buffer_size` | `4194304` | OS socket write buffer (bytes) |
 | `session_timeout` | `60s` | Idle session expiry duration |
 | `session_cleanup_interval` | `10s` | How often the background reaper evicts expired sessions |
 | `log_level` | `info` | `debug` \| `info` \| `warn` \| `error` |
@@ -205,6 +203,5 @@ config.example.yaml    # Annotated example configuration
 
 * Each frontend runs `worker_threads` concurrent `ReadFromUDP` goroutines to utilise multi-core systems.
 * Packet buffers are managed via `sync.Pool` to minimise allocations in the hot path.
-* OS socket buffers are tunable via `read_buffer_size` / `write_buffer_size`.
 * Session tracking uses a **256-shard striped map** to eliminate global locking; each shard has its own `sync.RWMutex`.
 * Atomic counters are used for all metrics to avoid lock overhead.
