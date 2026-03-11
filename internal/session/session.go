@@ -18,57 +18,76 @@ Addr         netip.AddrPort
 FrontendName string
 }
 
+// serverBinding bundles the backend address and eviction callback into a single
+// value that can be replaced atomically. The struct is immutable once stored;
+// swapping the pointer in Session.binding is the only mutation.
+type serverBinding struct {
+addr    string
+onEvict func()
+}
+
 // Session holds state for a single client session.
+// All fields are accessed via lock-free atomic operations; no mutex is needed.
 type Session struct {
-mu          sync.Mutex
-backendAddr string
-onEvict     func() // called when session is evicted or deleted
-LastSeen    time.Time
-PacketCount int64
-ByteCount   int64
+// binding stores the current backend address and eviction callback as a
+// single atomic pointer to an immutable serverBinding struct. Replacing
+// both fields is a single pointer swap, which is safe and wait-free.
+binding atomic.Pointer[serverBinding]
+
+// LastSeen is the Unix nanosecond timestamp of the most recent packet.
+// Stored atomically so the reaper can read it without acquiring any lock.
+LastSeen atomic.Int64
+
+// PacketCount and ByteCount are updated with atomic.Add on every packet.
+PacketCount atomic.Int64
+ByteCount   atomic.Int64
 }
 
 // NewSession creates a Session targeting backendAddr.
 func NewSession(backendAddr string) *Session {
-return &Session{backendAddr: backendAddr}
+s := &Session{}
+s.binding.Store(&serverBinding{addr: backendAddr})
+s.LastSeen.Store(time.Now().UnixNano())
+return s
 }
 
-// BackendAddr returns the current backend address under the session mutex.
+// BackendAddr returns the current backend address with a single atomic load.
 func (s *Session) BackendAddr() string {
-s.mu.Lock()
-defer s.mu.Unlock()
-return s.backendAddr
+if b := s.binding.Load(); b != nil {
+return b.addr
+}
+return ""
 }
 
-// UpdateServer atomically updates the backend address and the eviction callback.
+// UpdateServer atomically replaces the backend address and eviction callback.
+// The swap is a single pointer store — no lock, no blocking.
 func (s *Session) UpdateServer(addr string, onEvict func()) {
-s.mu.Lock()
-s.backendAddr = addr
-s.onEvict = onEvict
-s.mu.Unlock()
+s.binding.Store(&serverBinding{addr: addr, onEvict: onEvict})
 }
 
-// Touch updates the last-seen timestamp and packet/byte counters.
+// Touch records the current time and updates packet/byte counters.
+// All three updates are independent atomic operations; no lock is held.
 func (s *Session) Touch(bytes int64) {
-s.mu.Lock()
-s.LastSeen = time.Now()
-s.PacketCount++
-s.ByteCount += bytes
-s.mu.Unlock()
+s.LastSeen.Store(time.Now().UnixNano())
+s.PacketCount.Add(1)
+s.ByteCount.Add(bytes)
 }
 
-// callEvict invokes the eviction callback if one is registered. Must be called
-// without holding s.mu.
+// callEvict invokes the eviction callback registered via UpdateServer.
 func (s *Session) callEvict() {
-s.mu.Lock()
-fn := s.onEvict
-s.mu.Unlock()
-if fn != nil {
-fn()
+if b := s.binding.Load(); b != nil && b.onEvict != nil {
+b.onEvict()
 }
+}
+
+// LastSeenTime returns the last-seen timestamp as a time.Time.
+func (s *Session) LastSeenTime() time.Time {
+return time.Unix(0, s.LastSeen.Load())
 }
 
 // shard is a single stripe of the session table.
+// The RWMutex is required to protect the Go map; with 256 shards contention
+// is negligible. Everything inside the Session values is lock-free.
 type shard struct {
 mu      sync.RWMutex
 entries map[Key]*Session
@@ -123,7 +142,7 @@ h ^= uint32(port >> 8)
 h *= prime32
 h ^= uint32(port & 0xff)
 h *= prime32
-// Hash frontend name bytes without converting to []byte.
+// Hash frontend name bytes without allocating a []byte.
 for i := 0; i < len(key.FrontendName); i++ {
 h ^= uint32(key.FrontendName[i])
 h *= prime32
@@ -155,18 +174,15 @@ if sess != nil {
 return sess, false
 }
 
-// Produce the new session outside any lock.
+// Produce the new session outside any lock. NewSession sets LastSeen.
 newSess := newFn()
 if newSess == nil {
 return nil, false
 }
-newSess.LastSeen = time.Now()
-	newSess.LastSeen = time.Now()
-	// PacketCount starts at its zero value; Touch() counts the first packet,
-	// avoiding a double-count.
 
 s.mu.Lock()
-// Double-checked locking: another goroutine may have inserted while we held no lock.
+// Double-checked locking: another goroutine may have inserted while we
+// held no lock.
 if existing, ok := s.entries[key]; ok {
 s.mu.Unlock()
 return existing, false
@@ -223,16 +239,15 @@ for i := range t.shards {
 s := &t.shards[i]
 s.mu.Lock()
 for k, sess := range s.entries {
-sess.mu.Lock()
-expired := sess.LastSeen.Before(cutoff)
-sess.mu.Unlock()
-if expired {
+// LastSeen is an atomic.Int64 — read it without a per-session lock.
+if sess.LastSeenTime().Before(cutoff) {
 delete(s.entries, k)
 t.count.Add(-1)
-// Call eviction hook outside the shard lock to avoid deadlocks.
+// Run the eviction callback outside the shard lock.
 go sess.callEvict()
 }
 }
 s.mu.Unlock()
 }
 }
+

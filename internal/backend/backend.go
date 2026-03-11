@@ -8,7 +8,6 @@ import (
 "math/rand"
 "net"
 "net/netip"
-"sync"
 "sync/atomic"
 
 "github.com/ErwinsExpertise/light-udp-proxy/internal/config"
@@ -41,10 +40,14 @@ func (s *Server) DecrConns() { s.connCount.Add(-1) }
 func (s *Server) ConnCount() int64 { return s.connCount.Load() }
 
 // Pool manages a set of backend servers and load balancing state.
+//
+// servers and serverMap are immutable after NewPool returns: no servers are
+// added or removed at runtime. Individual server health is tracked by each
+// Server.Healthy (atomic.Bool), so no Pool-level lock is needed for reads or
+// health updates.
 type Pool struct {
-mu        sync.RWMutex
 servers   []*Server
-serverMap map[string]*Server // address -> *Server for O(1) lookup
+serverMap map[string]*Server // address → *Server for O(1) lookup
 name      string
 algorithm string
 log       *slog.Logger
@@ -94,26 +97,22 @@ return netip.AddrPortFrom(ip.Unmap(), uint16(udpAddr.Port)), nil
 func (p *Pool) Name() string { return p.name }
 
 // Servers returns a snapshot of all servers (healthy and unhealthy).
+// Safe to call without a lock because p.servers is immutable after NewPool.
 func (p *Pool) Servers() []*Server {
-p.mu.RLock()
 cp := make([]*Server, len(p.servers))
 copy(cp, p.servers)
-p.mu.RUnlock()
 return cp
 }
 
 // ServerByAddr returns the server with the given address in O(1), or nil.
+// Safe without a lock because p.serverMap is immutable after NewPool.
 func (p *Pool) ServerByAddr(addr string) *Server {
-p.mu.RLock()
-srv := p.serverMap[addr]
-p.mu.RUnlock()
-return srv
+return p.serverMap[addr]
 }
 
 // healthyServers returns the current list of healthy servers.
+// No lock needed: p.servers is immutable; Server.Healthy is atomic.
 func (p *Pool) healthyServers() []*Server {
-p.mu.RLock()
-defer p.mu.RUnlock()
 result := make([]*Server, 0, len(p.servers))
 for _, s := range p.servers {
 if s.Healthy.Load() {
@@ -174,13 +173,14 @@ return s
 }
 idx -= s.Weight
 }
-	// This path indicates a caller bug (idx out of range for totalWeight).
-	// Panic in tests so it can be caught early; in production fall back to
-	// the first available server to avoid dropping traffic.
-	if len(servers) > 0 {
-		return servers[0]
-	}
-	return nil
+// This path indicates a caller bug (idx out of range for totalWeight).
+// In tests this signals an implementation error and should be caught by
+// code review; in production we fall back gracefully to avoid dropping
+// traffic rather than panic-ing a live proxy process.
+if len(servers) > 0 {
+return servers[0]
+}
+return nil
 }
 
 // leastConn selects the server with the fewest active connections.
@@ -198,9 +198,8 @@ return best
 }
 
 // SetHealthy marks a server healthy or unhealthy by address.
+// No lock needed: p.servers is immutable; Server.Healthy is atomic.
 func (p *Pool) SetHealthy(addr string, healthy bool) {
-p.mu.RLock()
-defer p.mu.RUnlock()
 for _, s := range p.servers {
 if s.Address == addr {
 old := s.Healthy.Swap(healthy)
@@ -215,3 +214,4 @@ return
 }
 }
 }
+

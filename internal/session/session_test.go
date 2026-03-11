@@ -97,7 +97,8 @@ tbl.shards[i].entries = make(map[Key]*Session)
 key := makeKey("127.0.0.1:2222", "fe")
 idx := shardFor(key)
 sess := NewSession("b:80")
-sess.LastSeen = time.Now().Add(-200 * time.Millisecond)
+// Simulate an old session by backdating LastSeen.
+sess.LastSeen.Store(time.Now().Add(-200 * time.Millisecond).UnixNano())
 tbl.shards[idx].entries[key] = sess
 tbl.count.Store(1)
 
@@ -125,7 +126,7 @@ var mu sync.Mutex
 key := makeKey("127.0.0.1:5555", "fe")
 idx := shardFor(key)
 sess := NewSession("b:80")
-sess.LastSeen = time.Now().Add(-200 * time.Millisecond)
+sess.LastSeen.Store(time.Now().Add(-200 * time.Millisecond).UnixNano())
 sess.UpdateServer("b:80", func() {
 mu.Lock()
 called = true
@@ -147,22 +148,23 @@ t.Error("evict callback not called after expiry")
 
 func TestTouch(t *testing.T) {
 s := NewSession("b:80")
-s.LastSeen = time.Now().Add(-time.Second)
-before := s.LastSeen
+// Backdate LastSeen so we can verify Touch updates it.
+s.LastSeen.Store(time.Now().Add(-time.Second).UnixNano())
+before := s.LastSeenTime()
 s.Touch(100)
-if !s.LastSeen.After(before) {
+if !s.LastSeenTime().After(before) {
 t.Error("Touch did not update LastSeen")
 }
-if s.PacketCount != 1 {
-t.Errorf("PacketCount = %d after first Touch, want 1", s.PacketCount)
+if s.PacketCount.Load() != 1 {
+t.Errorf("PacketCount = %d after first Touch, want 1", s.PacketCount.Load())
 }
-if s.ByteCount != 100 {
-t.Errorf("ByteCount = %d, want 100", s.ByteCount)
+if s.ByteCount.Load() != 100 {
+t.Errorf("ByteCount = %d, want 100", s.ByteCount.Load())
 }
 }
 
 func TestPacketCountNotDoubled(t *testing.T) {
-// GetOrCreate initialises PacketCount=0; the first Touch call must set it to 1.
+// GetOrCreate initialises PacketCount at zero; the first Touch call must set it to 1.
 tbl := NewTable(5*time.Second, time.Second)
 defer tbl.Stop()
 key := makeKey("127.0.0.1:7777", "fe")
@@ -171,12 +173,12 @@ sess, created := tbl.GetOrCreate(key, func() *Session { return NewSession("b:80"
 if !created {
 t.Fatal("expected new session")
 }
-if sess.PacketCount != 0 {
-t.Errorf("PacketCount after GetOrCreate = %d, want 0", sess.PacketCount)
+if sess.PacketCount.Load() != 0 {
+t.Errorf("PacketCount after GetOrCreate = %d, want 0", sess.PacketCount.Load())
 }
 sess.Touch(50)
-if sess.PacketCount != 1 {
-t.Errorf("PacketCount after first Touch = %d, want 1", sess.PacketCount)
+if sess.PacketCount.Load() != 1 {
+t.Errorf("PacketCount after first Touch = %d, want 1", sess.PacketCount.Load())
 }
 }
 
