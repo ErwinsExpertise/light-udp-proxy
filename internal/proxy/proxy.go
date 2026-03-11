@@ -84,7 +84,7 @@ func (p *Proxy) start() error {
 	}
 
 	// Session table (shared across frontends).
-	p.sessions = session.NewTable(p.cfg.Global.SessionTimeout)
+	p.sessions = session.NewTable(p.cfg.Global.SessionTimeout, p.cfg.Global.SessionCleanupInterval)
 
 	// Metrics server.
 	p.metrics = metrics.New(p.cfg.Global.MetricsAddr, p.counters, p.log)
@@ -123,8 +123,7 @@ func (p *Proxy) start() error {
 		}
 		fe := frontend.New(fcfg, pool, p.sessions, p.counters,
 			p.cfg.Global.MaxPacketSize, p.log)
-		if err := fe.Start(p.cfg.Global.WorkerThreads,
-			p.cfg.Global.ReadBufferSize, p.cfg.Global.WriteBufferSize); err != nil {
+		if err := fe.Start(p.cfg.Global.WorkerThreads, p.cfg.Global.Socket); err != nil {
 			return err
 		}
 		p.frontends = append(p.frontends, fe)

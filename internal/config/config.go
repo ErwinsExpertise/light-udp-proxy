@@ -18,13 +18,26 @@ type Config struct {
 
 // GlobalConfig contains global proxy settings.
 type GlobalConfig struct {
-	MaxPacketSize   int           `yaml:"max_packet_size"`
-	WorkerThreads   int           `yaml:"worker_threads"`
-	ReadBufferSize  int           `yaml:"read_buffer_size"`
-	WriteBufferSize int           `yaml:"write_buffer_size"`
-	SessionTimeout  time.Duration `yaml:"session_timeout"`
-	LogLevel        string        `yaml:"log_level"`
-	MetricsAddr     string        `yaml:"metrics_addr"`
+	MaxPacketSize           int           `yaml:"max_packet_size"`
+	WorkerThreads           int           `yaml:"worker_threads"`
+	ReadBufferSize          int           `yaml:"read_buffer_size"`
+	WriteBufferSize         int           `yaml:"write_buffer_size"`
+	SessionTimeout          time.Duration `yaml:"session_timeout"`
+	SessionCleanupInterval  time.Duration `yaml:"session_cleanup_interval"`
+	LogLevel                string        `yaml:"log_level"`
+	MetricsAddr             string        `yaml:"metrics_addr"`
+	Socket                  SocketConfig  `yaml:"socket"`
+}
+
+// SocketConfig holds kernel-level socket tuning options.
+type SocketConfig struct {
+	// RcvBuf sets SO_RCVBUF (kernel receive buffer) in bytes. 0 = OS default.
+	RcvBuf int `yaml:"rcvbuf"`
+	// SndBuf sets SO_SNDBUF (kernel send buffer) in bytes. 0 = OS default.
+	SndBuf int `yaml:"sndbuf"`
+	// ReusePort enables SO_REUSEPORT, allowing multiple goroutines to bind the
+	// same port and letting the kernel distribute packets across them.
+	ReusePort bool `yaml:"reuse_port"`
 }
 
 // FrontendConfig defines a listening frontend.
@@ -76,6 +89,9 @@ func (c *Config) defaults() {
 	}
 	if c.Global.SessionTimeout <= 0 {
 		c.Global.SessionTimeout = 60 * time.Second
+	}
+	if c.Global.SessionCleanupInterval <= 0 {
+		c.Global.SessionCleanupInterval = 10 * time.Second
 	}
 	if c.Global.LogLevel == "" {
 		c.Global.LogLevel = "info"

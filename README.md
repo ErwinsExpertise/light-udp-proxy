@@ -48,7 +48,7 @@ Server 1    Server 2   ...
 
 ## Requirements
 
-* Go 1.22 or later
+* Go 1.24 or later
 
 ---
 
@@ -85,8 +85,12 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 | `read_buffer_size` | `4194304` | OS socket read buffer (bytes) |
 | `write_buffer_size` | `4194304` | OS socket write buffer (bytes) |
 | `session_timeout` | `60s` | Idle session expiry duration |
+| `session_cleanup_interval` | `10s` | How often the background reaper evicts expired sessions |
 | `log_level` | `info` | `debug` \| `info` \| `warn` \| `error` |
 | `metrics_addr` | `0.0.0.0:9090` | HTTP metrics listen address |
+| `socket.rcvbuf` | `0` | SO_RCVBUF kernel receive buffer in bytes (`0` = OS default) |
+| `socket.sndbuf` | `0` | SO_SNDBUF kernel send buffer in bytes (`0` = OS default) |
+| `socket.reuse_port` | `false` | SO_REUSEPORT (Linux): each worker goroutine gets its own socket for kernel-level multi-core distribution |
 
 ### `frontends[]`
 
@@ -145,6 +149,29 @@ A `/healthz` endpoint returns `ok` (HTTP 200) when the proxy process is alive.
 
 ---
 
+## Releases
+
+Every push to `main` automatically:
+
+1. **Bumps the semver tag** using commit-message conventions:
+   - `feat:` → minor bump (e.g. `v1.1.0`)
+   - `fix:` / `perf:` → patch bump (e.g. `v1.0.1`)
+   - `BREAKING CHANGE` in commit body → major bump (e.g. `v2.0.0`)
+   - Anything else → patch bump (default)
+
+2. **Runs GoReleaser** to build and publish a GitHub Release with binaries for:
+
+| OS | Architectures |
+|---|---|
+| Linux | amd64, arm64, armv6, armv7 |
+| macOS | amd64, arm64 |
+| FreeBSD | amd64, arm64 |
+| Windows | amd64 |
+
+Each release includes SHA-256 checksums and a `config.example.yaml`.
+
+---
+
 ## Tests
 
 ```bash
@@ -179,5 +206,5 @@ config.example.yaml    # Annotated example configuration
 * Each frontend runs `worker_threads` concurrent `ReadFromUDP` goroutines to utilise multi-core systems.
 * Packet buffers are managed via `sync.Pool` to minimise allocations in the hot path.
 * OS socket buffers are tunable via `read_buffer_size` / `write_buffer_size`.
-* Session lookup uses a sharded read-write mutex to reduce contention.
+* Session tracking uses a **256-shard striped map** to eliminate global locking; each shard has its own `sync.RWMutex`.
 * Atomic counters are used for all metrics to avoid lock overhead.
