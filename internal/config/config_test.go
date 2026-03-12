@@ -74,8 +74,9 @@ func TestParseValidConfig(t *testing.T) {
 	if !cfg.Global.TrafficShaping.Enabled {
 		t.Errorf("TrafficShaping.Enabled = false, want true")
 	}
-	if int64(cfg.Global.TrafficShaping.BytesPerSecond) != 200*1024*1024 {
-		t.Errorf("TrafficShaping.BytesPerSecond = %d, want 209715200", cfg.Global.TrafficShaping.BytesPerSecond)
+	wantBytesPerSecond := int64(200 * 1024 * 1024)
+	if int64(cfg.Global.TrafficShaping.BytesPerSecond) != wantBytesPerSecond {
+		t.Errorf("TrafficShaping.BytesPerSecond = %d, want %d", cfg.Global.TrafficShaping.BytesPerSecond, wantBytesPerSecond)
 	}
 	if cfg.Global.ClientLimits.PacketsPerSecond != 500 {
 		t.Errorf("ClientLimits.PacketsPerSecond = %d, want 500", cfg.Global.ClientLimits.PacketsPerSecond)

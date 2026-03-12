@@ -186,12 +186,12 @@ if err != nil {
 t.Fatalf("client dial: %v", err)
 }
 defer clientConn.Close()
-fragmentLikePayload := []byte{
+fragmentedIPv4Packet := []byte{
 0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x20, 0x00,
 0x40, 0x11, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x01,
 0x7f, 0x00, 0x00, 0x01,
 }
-if _, err := clientConn.Write(fragmentLikePayload); err != nil {
+if _, err := clientConn.Write(fragmentedIPv4Packet); err != nil {
 t.Fatalf("client write: %v", err)
 }
 time.Sleep(100 * time.Millisecond)

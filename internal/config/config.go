@@ -98,7 +98,7 @@ func parseByteSize(value string) (int64, error) {
 		return 0, nil
 	}
 	end := len(s)
-	for end > 0 && s[end-1] >= 'A' && s[end-1] <= 'z' {
+	for end > 0 && ((s[end-1] >= 'A' && s[end-1] <= 'Z') || (s[end-1] >= 'a' && s[end-1] <= 'z')) {
 		end--
 	}
 	numPart := strings.TrimSpace(s[:end])

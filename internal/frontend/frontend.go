@@ -286,7 +286,6 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 		if f.abuseProtector != nil && !f.abuseProtector.Allow(clientAddr, now) {
 			f.counters.PacketsDropped.Add(1)
 			f.counters.PacketsDroppedAbuse.Add(1)
-			f.counters.PacketsDroppedRateLimit.Add(1)
 			f.bufPool.Put(bufPtr)
 			continue
 		}
