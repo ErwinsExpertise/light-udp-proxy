@@ -19,6 +19,28 @@ global:
   # HTTP metrics endpoint address
   metrics_addr: "0.0.0.0:9090"
 
+  # Global token-bucket traffic shaping
+  traffic_shaping:
+    enabled: true
+    packets_per_second: 200000
+    bytes_per_second: 200MB
+    burst_packets: 50000
+
+  # Per-client source-IP shaping
+  client_limits:
+    packets_per_second: 500
+    burst_packets: 100
+
+  # Lightweight abuse protection
+  abuse_protection:
+    enabled: true
+    max_packets_per_second_per_ip: 20000
+    max_sessions_per_ip: 200
+
+  # Drop fragmented IPv4 packets when enabled
+  fragmentation:
+    drop_fragments: false
+
   # Kernel-level socket tuning (applied via net.ListenConfig before bind)
   socket:
     # SO_RCVBUF — kernel receive buffer per socket in bytes (0 = OS default)
@@ -44,11 +66,17 @@ frontends:
     session_affinity: true
     # Maximum concurrent sessions (0 = unlimited)
     max_sessions: 10000
+    # QoS priority: critical | high | normal | low | bulk
+    priority: high
+    traffic_shaping:
+      packets_per_second: 50000
+      burst_packets: 10000
 
   - name: voip_udp
     listen: "0.0.0.0:5060"
     backend: voip_servers
     session_affinity: true
+    priority: critical
 
   - name: media_udp
     listen: "0.0.0.0:5004"
@@ -56,6 +84,7 @@ frontends:
     session_affinity: false
     # Per-frontend packet size override (0 = use global)
     max_packet_size: 1500
+    priority: low
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Backends
@@ -65,6 +94,8 @@ backends:
   - name: game_servers
     # Load balancing algorithm: round_robin | least_conn | random | hash
     load_balance: round_robin
+    traffic_shaping:
+      packets_per_second: 100000
     health_check:
       enabled: true
       interval: 5s

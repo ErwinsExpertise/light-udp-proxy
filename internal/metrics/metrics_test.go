@@ -19,6 +19,10 @@ counters := &metrics.Counters{}
 counters.PacketsReceived.Store(42)
 counters.PacketsForwarded.Store(40)
 counters.PacketsDropped.Store(2)
+counters.PacketsShaped.Store(1)
+counters.PacketsDroppedRateLimit.Store(3)
+counters.PacketsDroppedFragment.Store(4)
+counters.PacketsDroppedAbuse.Store(5)
 
 // Bind to a random port so the test is safe to run in parallel.
 srv := metrics.New("127.0.0.1:0", counters, log)
@@ -54,6 +58,12 @@ t.Errorf("packets_received = %v, want 42", body["packets_received"])
 }
 if v, ok := body["packets_forwarded"].(float64); !ok || int(v) != 40 {
 t.Errorf("packets_forwarded = %v, want 40", body["packets_forwarded"])
+}
+if v, ok := body["packets_shaped"].(float64); !ok || int(v) != 1 {
+t.Errorf("packets_shaped = %v, want 1", body["packets_shaped"])
+}
+if v, ok := body["packets_dropped_rate_limit"].(float64); !ok || int(v) != 3 {
+t.Errorf("packets_dropped_rate_limit = %v, want 3", body["packets_dropped_rate_limit"])
 }
 
 // /healthz must return 200 ok.
@@ -100,6 +110,10 @@ counters := &metrics.Counters{}
 counters.PacketsReceived.Add(10)
 counters.PacketsForwarded.Add(8)
 counters.PacketsDropped.Add(2)
+counters.PacketsShaped.Add(1)
+counters.PacketsDroppedRateLimit.Add(1)
+counters.PacketsDroppedFragment.Add(1)
+counters.PacketsDroppedAbuse.Add(1)
 counters.BytesIn.Add(1000)
 counters.BytesOut.Add(900)
 counters.ActiveSessions.Add(5)
@@ -112,6 +126,9 @@ t.Errorf("PacketsForwarded = %d, want 8", counters.PacketsForwarded.Load())
 }
 if counters.PacketsDropped.Load() != 2 {
 t.Errorf("PacketsDropped = %d, want 2", counters.PacketsDropped.Load())
+}
+if counters.PacketsDroppedRateLimit.Load() != 1 {
+t.Errorf("PacketsDroppedRateLimit = %d, want 1", counters.PacketsDroppedRateLimit.Load())
 }
 if counters.ActiveSessions.Load() != 5 {
 t.Errorf("ActiveSessions = %d, want 5", counters.ActiveSessions.Load())

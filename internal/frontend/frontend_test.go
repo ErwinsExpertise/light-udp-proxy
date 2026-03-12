@@ -13,9 +13,14 @@ import (
 "github.com/ErwinsExpertise/light-udp-proxy/internal/frontend"
 "github.com/ErwinsExpertise/light-udp-proxy/internal/metrics"
 "github.com/ErwinsExpertise/light-udp-proxy/internal/session"
+"github.com/ErwinsExpertise/light-udp-proxy/internal/shaping"
 )
 
 func newTestFrontend(t *testing.T, listen, backendAddr string) (*frontend.Frontend, *metrics.Counters) {
+return newTestFrontendWithOptions(t, listen, backendAddr, frontend.RuntimeOptions{})
+}
+
+func newTestFrontendWithOptions(t *testing.T, listen, backendAddr string, opts frontend.RuntimeOptions) (*frontend.Frontend, *metrics.Counters) {
 t.Helper()
 log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 bcfg := config.BackendConfig{
@@ -35,7 +40,7 @@ Name:    t.Name(),
 Listen:  listen,
 Backend: "be",
 }
-fe := frontend.New(fcfg, pool, sessions, counters, 65535, log)
+fe := frontend.New(fcfg, pool, sessions, counters, 65535, opts, log)
 return fe, counters
 }
 
@@ -133,4 +138,64 @@ if err != nil {
 t.Skipf("SO_REUSEPORT not available: %v", err)
 }
 fe.Stop()
+}
+
+func TestFrontendDropsShapedPackets(t *testing.T) {
+fe, counters := newTestFrontendWithOptions(t, "127.0.0.1:0", "127.0.0.1:9999", frontend.RuntimeOptions{
+FrontendShaper: shaping.NewBucket(shaping.Limits{
+Enabled:          true,
+PacketsPerSecond: 1,
+BurstPackets:     1,
+}),
+})
+if err := fe.Start(1, config.SocketConfig{}); err != nil {
+t.Fatalf("Start: %v", err)
+}
+defer fe.Stop()
+
+clientConn, err := net.Dial("udp", fe.Addr())
+if err != nil {
+t.Fatalf("client dial: %v", err)
+}
+defer clientConn.Close()
+for i := 0; i < 8; i++ {
+if _, err := clientConn.Write([]byte("shape-test")); err != nil {
+t.Fatalf("client write: %v", err)
+}
+}
+time.Sleep(100 * time.Millisecond)
+if counters.PacketsShaped.Load() == 0 {
+t.Fatal("expected shaped packets to be dropped")
+}
+if counters.PacketsDroppedRateLimit.Load() == 0 {
+t.Fatal("expected rate-limit drop counter increment")
+}
+}
+
+func TestFrontendDropsFragmentsWhenEnabled(t *testing.T) {
+fe, counters := newTestFrontendWithOptions(t, "127.0.0.1:0", "127.0.0.1:9999", frontend.RuntimeOptions{
+DropFragments: true,
+})
+if err := fe.Start(1, config.SocketConfig{}); err != nil {
+t.Fatalf("Start: %v", err)
+}
+defer fe.Stop()
+
+clientConn, err := net.Dial("udp", fe.Addr())
+if err != nil {
+t.Fatalf("client dial: %v", err)
+}
+defer clientConn.Close()
+fragmentLikePayload := []byte{
+0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x20, 0x00,
+0x40, 0x11, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x01,
+0x7f, 0x00, 0x00, 0x01,
+}
+if _, err := clientConn.Write(fragmentLikePayload); err != nil {
+t.Fatalf("client write: %v", err)
+}
+time.Sleep(100 * time.Millisecond)
+if counters.PacketsDroppedFragment.Load() == 0 {
+t.Fatal("expected fragment drops")
+}
 }

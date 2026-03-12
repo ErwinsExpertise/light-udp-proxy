@@ -7,15 +7,19 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/abuse"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/config"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/frontend"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/healthcheck"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/metrics"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/qos"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/session"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/shaping"
 	"github.com/ErwinsExpertise/light-udp-proxy/pkg/logger"
 )
 
@@ -126,14 +130,59 @@ func (p *Proxy) start() error {
 	}
 
 	// Start frontends.
+	globalShaper := shaping.NewBucket(limitsFromTrafficConfig(p.cfg.Global.TrafficShaping))
+	clientShaper := shaping.NewClientLimiter(shaping.Limits{
+		PacketsPerSecond: p.cfg.Global.ClientLimits.PacketsPerSecond,
+		BurstPackets:     p.cfg.Global.ClientLimits.BurstPackets,
+	}, p.cfg.Global.SessionTimeout)
+	abuseProtector := abuse.New(abuse.Config{
+		Enabled:              p.cfg.Global.AbuseProtection.Enabled,
+		MaxPacketsPerSecond:  p.cfg.Global.AbuseProtection.MaxPacketsPerSecondPerIP,
+		MaxSessionsPerClient: p.cfg.Global.AbuseProtection.MaxSessionsPerIP,
+		SessionTTL:           p.cfg.Global.SessionTimeout,
+	})
+	backendShapers := make(map[string]*shaping.Bucket, len(p.cfg.Backends))
+	for _, bcfg := range p.cfg.Backends {
+		backendShapers[bcfg.Name] = shaping.NewBucket(limitsFromTrafficConfig(bcfg.TrafficShaping))
+	}
+
+	type frontendEntry struct {
+		cfg      config.FrontendConfig
+		priority qos.Priority
+	}
+	ordered := make([]frontendEntry, 0, len(p.cfg.Frontends))
 	for _, fcfg := range p.cfg.Frontends {
+		pv, err := qos.ParsePriority(fcfg.Priority)
+		if err != nil {
+			return fmt.Errorf("frontend %q: %w", fcfg.Name, err)
+		}
+		ordered = append(ordered, frontendEntry{cfg: fcfg, priority: pv})
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].priority > ordered[j].priority
+	})
+	for _, item := range ordered {
+		fcfg := item.cfg
 		pool, ok := p.backends[fcfg.Backend]
 		if !ok {
 			return fmt.Errorf("frontend %q: unknown backend %q", fcfg.Name, fcfg.Backend)
 		}
+		workers := p.cfg.Global.WorkerThreads * item.priority.WorkerMultiplier() / qos.PriorityNormal.WorkerMultiplier()
+		if workers < 1 {
+			workers = 1
+		}
 		fe := frontend.New(fcfg, pool, p.sessions, p.counters,
-			p.cfg.Global.MaxPacketSize, p.log)
-		if err := fe.Start(p.cfg.Global.WorkerThreads, p.cfg.Global.Socket); err != nil {
+			p.cfg.Global.MaxPacketSize,
+			frontend.RuntimeOptions{
+				GlobalShaper:   globalShaper,
+				FrontendShaper: shaping.NewBucket(limitsFromTrafficConfig(fcfg.TrafficShaping)),
+				BackendShaper:  backendShapers[fcfg.Backend],
+				ClientShaper:   clientShaper,
+				AbuseProtector: abuseProtector,
+				DropFragments:  p.cfg.Global.Fragmentation.DropFragments,
+			},
+			p.log)
+		if err := fe.Start(workers, p.cfg.Global.Socket); err != nil {
 			return err
 		}
 		p.frontends = append(p.frontends, fe)
@@ -173,4 +222,14 @@ func (p *Proxy) reload() error {
 	p.backends = make(map[string]*backend.Pool)
 	p.counters = &metrics.Counters{}
 	return p.start()
+}
+
+func limitsFromTrafficConfig(cfg config.TrafficShapingConfig) shaping.Limits {
+	return shaping.Limits{
+		Enabled:          cfg.Enabled,
+		PacketsPerSecond: cfg.PacketsPerSecond,
+		BytesPerSecond:   int64(cfg.BytesPerSecond),
+		BurstPackets:     cfg.BurstPackets,
+		BurstBytes:       int64(cfg.BurstBytes),
+	}
 }

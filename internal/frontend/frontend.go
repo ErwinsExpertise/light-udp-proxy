@@ -8,11 +8,15 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/abuse"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/config"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/fragment"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/metrics"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/session"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/shaping"
 )
 
 // pkt is a forwarding work item passed from reader goroutines to forwarding workers.
@@ -50,7 +54,23 @@ type Frontend struct {
 	// bufPool re-uses packet buffers to eliminate per-packet allocations.
 	bufPool sync.Pool
 
-	maxPacketSize int
+	maxPacketSize  int
+	globalShaper   *shaping.Bucket
+	frontendShaper *shaping.Bucket
+	backendShaper  *shaping.Bucket
+	clientShaper   *shaping.ClientLimiter
+	abuseProtector *abuse.Protector
+	dropFragments  bool
+}
+
+// RuntimeOptions configures packet policy for a frontend.
+type RuntimeOptions struct {
+	GlobalShaper   *shaping.Bucket
+	FrontendShaper *shaping.Bucket
+	BackendShaper  *shaping.Bucket
+	ClientShaper   *shaping.ClientLimiter
+	AbuseProtector *abuse.Protector
+	DropFragments  bool
 }
 
 // New creates a Frontend.
@@ -60,19 +80,26 @@ func New(
 	sessions *session.Table,
 	counters *metrics.Counters,
 	maxPacketSize int,
+	opts RuntimeOptions,
 	log *slog.Logger,
 ) *Frontend {
 	if cfg.MaxPacketSize > 0 {
 		maxPacketSize = cfg.MaxPacketSize
 	}
 	f := &Frontend{
-		cfg:           cfg,
-		pool:          pool,
-		sessions:      sessions,
-		counters:      counters,
-		log:           log,
-		stopCh:        make(chan struct{}),
-		maxPacketSize: maxPacketSize,
+		cfg:            cfg,
+		pool:           pool,
+		sessions:       sessions,
+		counters:       counters,
+		log:            log,
+		stopCh:         make(chan struct{}),
+		maxPacketSize:  maxPacketSize,
+		globalShaper:   opts.GlobalShaper,
+		frontendShaper: opts.FrontendShaper,
+		backendShaper:  opts.BackendShaper,
+		clientShaper:   opts.ClientShaper,
+		abuseProtector: opts.AbuseProtector,
+		dropFragments:  opts.DropFragments,
 	}
 	f.bufPool = sync.Pool{
 		New: func() any {
@@ -241,6 +268,29 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 			continue
 		}
 
+		if f.dropFragments && fragment.IsFragmentedIPv4(buf[:n]) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsDroppedFragment.Add(1)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
+		now := time.Now()
+		if !f.allowShaped(clientAddr, n, now) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsShaped.Add(1)
+			f.counters.PacketsDroppedRateLimit.Add(1)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+		if f.abuseProtector != nil && !f.abuseProtector.Allow(clientAddr, now) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsDroppedAbuse.Add(1)
+			f.counters.PacketsDroppedRateLimit.Add(1)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
 		// Session cap: only call Len() (O(1) atomic read) when we would
 		// otherwise create a new session. For existing sessions, no check needed.
 		if f.cfg.MaxSessions > 0 {
@@ -352,6 +402,12 @@ func (f *Frontend) forward(p pkt) {
 	}
 
 	// Use WriteToUDPAddrPort for a zero-allocation send path.
+	if f.backendShaper != nil && !f.backendShaper.Allow(p.n, time.Now()) {
+		f.counters.PacketsDropped.Add(1)
+		f.counters.PacketsShaped.Add(1)
+		f.counters.PacketsDroppedRateLimit.Add(1)
+		return
+	}
 	if _, err := f.sendConn.WriteToUDPAddrPort(payload, srv.AddrPort()); err != nil {
 		f.counters.PacketsDropped.Add(1)
 		f.log.Debug("send error", "frontend", f.cfg.Name, "backend", srv.Address, "err", err)
@@ -360,4 +416,17 @@ func (f *Frontend) forward(p pkt) {
 
 	f.counters.PacketsForwarded.Add(1)
 	f.counters.BytesOut.Add(int64(p.n))
+}
+
+func (f *Frontend) allowShaped(clientAddr netip.AddrPort, packetSize int, now time.Time) bool {
+	if f.globalShaper != nil && !f.globalShaper.Allow(packetSize, now) {
+		return false
+	}
+	if f.frontendShaper != nil && !f.frontendShaper.Allow(packetSize, now) {
+		return false
+	}
+	if f.clientShaper != nil && !f.clientShaper.Allow(clientAddr.Addr(), packetSize, now) {
+		return false
+	}
+	return true
 }
