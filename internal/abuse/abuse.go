@@ -61,6 +61,7 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 	idx := int(ip.As16()[14]^ip.As16()[15]) % len(p.shards)
 	sh := &p.shards[idx]
 	nowSec := now.Unix()
+	ttlSeconds := int64(p.cfg.SessionTTL.Seconds())
 
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -81,7 +82,7 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 		}
 		e.packets++
 		if e.packets > p.cfg.MaxPacketsPerSecond {
-			if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+			if nowSec-sh.lastSweep >= ttlSeconds {
 				p.sweepLocked(sh, now)
 				sh.lastSweep = nowSec
 			}
@@ -92,12 +93,12 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 	if p.cfg.MaxSessionsPerClient > 0 {
 		port := addr.Port()
 		e.sessions[port] = nowSec
-		if nowSec-e.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+		if nowSec-e.lastSweep >= ttlSeconds {
 			p.sweepEntrySessionsLocked(e, now)
 			e.lastSweep = nowSec
 		}
 		if len(e.sessions) > p.cfg.MaxSessionsPerClient {
-			if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+			if nowSec-sh.lastSweep >= ttlSeconds {
 				p.sweepLocked(sh, now)
 				sh.lastSweep = nowSec
 			}
@@ -105,7 +106,7 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 		}
 	}
 
-	if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+	if nowSec-sh.lastSweep >= ttlSeconds {
 		p.sweepLocked(sh, now)
 		sh.lastSweep = nowSec
 	}

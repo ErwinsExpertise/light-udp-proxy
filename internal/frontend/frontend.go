@@ -19,6 +19,10 @@ import (
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/shaping"
 )
 
+// fragmentOOBBufferSize is large enough to hold a few small IP control
+// messages (including IP_RECVFRAGSIZE) returned by recvmsg.
+const fragmentOOBBufferSize = 128
+
 // pkt is a forwarding work item passed from reader goroutines to forwarding workers.
 // The bufPtr field is owned by the work item until the worker returns it to the pool.
 type pkt struct {
@@ -259,7 +263,7 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 			err        error
 			oobN       int
 		)
-		var oob [128]byte
+		var oob [fragmentOOBBufferSize]byte
 		if f.dropFragments && f.fragmentAware {
 			n, oobN, _, clientAddr, err = conn.ReadMsgUDPAddrPort(buf, oob[:])
 		} else {
