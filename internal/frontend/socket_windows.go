@@ -1,4 +1,4 @@
-//go:build !linux && !windows
+//go:build windows
 
 package frontend
 
@@ -10,21 +10,20 @@ import (
 )
 
 // newListenConfig returns a net.ListenConfig that sets SO_RCVBUF and SO_SNDBUF
-// on platforms other than Linux. SO_REUSEPORT is not applied here because its
-// load-balancing semantics are Linux-specific.
+// on Windows. SO_REUSEPORT is not supported on Windows.
 func newListenConfig(socketCfg config.SocketConfig) net.ListenConfig {
 	return net.ListenConfig{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			var lastErr error
 			_ = c.Control(func(fd uintptr) {
-				ifd := int(fd)
+				handle := syscall.Handle(fd)
 				if socketCfg.RcvBuf > 0 {
-					if err := syscall.SetsockoptInt(ifd, syscall.SOL_SOCKET, syscall.SO_RCVBUF, socketCfg.RcvBuf); err != nil {
+					if err := syscall.SetsockoptInt(handle, syscall.SOL_SOCKET, syscall.SO_RCVBUF, socketCfg.RcvBuf); err != nil {
 						lastErr = err
 					}
 				}
 				if socketCfg.SndBuf > 0 {
-					if err := syscall.SetsockoptInt(ifd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, socketCfg.SndBuf); err != nil {
+					if err := syscall.SetsockoptInt(handle, syscall.SOL_SOCKET, syscall.SO_SNDBUF, socketCfg.SndBuf); err != nil {
 						lastErr = err
 					}
 				}
