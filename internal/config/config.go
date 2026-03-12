@@ -11,7 +11,7 @@ import (
 
 // Config is the top-level configuration structure.
 type Config struct {
-	Global    GlobalConfig    `yaml:"global"`
+	Global    GlobalConfig     `yaml:"global"`
 	Frontends []FrontendConfig `yaml:"frontends"`
 	Backends  []BackendConfig  `yaml:"backends"`
 }
@@ -50,8 +50,8 @@ type FrontendConfig struct {
 
 // BackendConfig defines a pool of servers.
 type BackendConfig struct {
-	Name        string        `yaml:"name"`
-	LoadBalance string        `yaml:"load_balance"`
+	Name        string            `yaml:"name"`
+	LoadBalance string            `yaml:"load_balance"`
 	HealthCheck HealthCheckConfig `yaml:"health_check"`
 	Servers     []ServerConfig    `yaml:"servers"`
 }
@@ -133,6 +133,9 @@ func (c *Config) validate() error {
 			if s.Address == "" {
 				return fmt.Errorf("backend %q: server address must not be empty", b.Name)
 			}
+		}
+		if _, dup := backendNames[b.Name]; dup {
+			return fmt.Errorf("duplicate backend name %q", b.Name)
 		}
 		backendNames[b.Name] = struct{}{}
 	}

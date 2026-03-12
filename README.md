@@ -68,7 +68,12 @@ go build -o udp-proxy ./cmd/udp-proxy
 ./udp-proxy -config config.example.yaml
 ```
 
-The only accepted flag is `-config`.  All settings must be in the YAML file.
+Available flags:
+
+| Flag | Description |
+|---|---|
+| `-config` | Path to YAML configuration file (required) |
+| `-version` | Print version, commit, and build date, then exit |
 
 ---
 

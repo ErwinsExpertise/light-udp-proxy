@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
@@ -29,6 +30,7 @@ type Proxy struct {
 	backends   map[string]*backend.Pool
 	sessions   *session.Table
 	hcCancel   context.CancelFunc
+	hcWg       sync.WaitGroup // tracks running health-checker goroutines
 }
 
 // New creates a Proxy from a config file path.
@@ -116,7 +118,11 @@ func (p *Proxy) start() error {
 	for _, bcfg := range p.cfg.Backends {
 		pool := p.backends[bcfg.Name]
 		checker := healthcheck.New(pool, bcfg.HealthCheck, p.log)
-		go checker.Run(hcCtx)
+		p.hcWg.Add(1)
+		go func() {
+			defer p.hcWg.Done()
+			checker.Run(hcCtx)
+		}()
 	}
 
 	// Start frontends.
@@ -142,6 +148,7 @@ func (p *Proxy) stop() {
 	}
 	if p.hcCancel != nil {
 		p.hcCancel()
+		p.hcWg.Wait() // wait for all checker goroutines to exit
 	}
 	if p.metrics != nil {
 		p.metrics.Stop()
@@ -167,4 +174,3 @@ func (p *Proxy) reload() error {
 	p.counters = &metrics.Counters{}
 	return p.start()
 }
-
