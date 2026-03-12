@@ -13,11 +13,15 @@ import (
 
 // Counters holds global proxy statistics.
 type Counters struct {
-	PacketsReceived  atomic.Int64
-	PacketsForwarded atomic.Int64
-	PacketsDropped   atomic.Int64
-	BytesIn          atomic.Int64
-	BytesOut         atomic.Int64
+	PacketsReceived         atomic.Int64
+	PacketsForwarded        atomic.Int64
+	PacketsDropped          atomic.Int64
+	PacketsShaped           atomic.Int64
+	PacketsDroppedRateLimit atomic.Int64
+	PacketsDroppedFragment  atomic.Int64
+	PacketsDroppedAbuse     atomic.Int64
+	BytesIn                 atomic.Int64
+	BytesOut                atomic.Int64
 	// ActiveSessions is kept for direct counter access by tests; the proxy uses
 	// RegisterSessionCount so that the session table drives this value instead.
 	ActiveSessions atomic.Int64
@@ -106,13 +110,17 @@ func (s *Server) Stop() {
 }
 
 type metricsResponse struct {
-	PacketsReceived  int64           `json:"packets_received"`
-	PacketsForwarded int64           `json:"packets_forwarded"`
-	PacketsDropped   int64           `json:"packets_dropped"`
-	BytesIn          int64           `json:"bytes_in"`
-	BytesOut         int64           `json:"bytes_out"`
-	ActiveSessions   int64           `json:"active_sessions"`
-	Backends         []BackendStatus `json:"backends"`
+	PacketsReceived         int64           `json:"packets_received"`
+	PacketsForwarded        int64           `json:"packets_forwarded"`
+	PacketsDropped          int64           `json:"packets_dropped"`
+	PacketsShaped           int64           `json:"packets_shaped"`
+	PacketsDroppedRateLimit int64           `json:"packets_dropped_rate_limit"`
+	PacketsDroppedFragment  int64           `json:"packets_dropped_fragment"`
+	PacketsDroppedAbuse     int64           `json:"packets_dropped_abuse"`
+	BytesIn                 int64           `json:"bytes_in"`
+	BytesOut                int64           `json:"bytes_out"`
+	ActiveSessions          int64           `json:"active_sessions"`
+	Backends                []BackendStatus `json:"backends"`
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -121,12 +129,16 @@ func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		activeSessions = s.sessionCountFn()
 	}
 	resp := metricsResponse{
-		PacketsReceived:  s.counters.PacketsReceived.Load(),
-		PacketsForwarded: s.counters.PacketsForwarded.Load(),
-		PacketsDropped:   s.counters.PacketsDropped.Load(),
-		BytesIn:          s.counters.BytesIn.Load(),
-		BytesOut:         s.counters.BytesOut.Load(),
-		ActiveSessions:   activeSessions,
+		PacketsReceived:         s.counters.PacketsReceived.Load(),
+		PacketsForwarded:        s.counters.PacketsForwarded.Load(),
+		PacketsDropped:          s.counters.PacketsDropped.Load(),
+		PacketsShaped:           s.counters.PacketsShaped.Load(),
+		PacketsDroppedRateLimit: s.counters.PacketsDroppedRateLimit.Load(),
+		PacketsDroppedFragment:  s.counters.PacketsDroppedFragment.Load(),
+		PacketsDroppedAbuse:     s.counters.PacketsDroppedAbuse.Load(),
+		BytesIn:                 s.counters.BytesIn.Load(),
+		BytesOut:                s.counters.BytesOut.Load(),
+		ActiveSessions:          activeSessions,
 	}
 	for _, fn := range s.statusFns {
 		resp.Backends = append(resp.Backends, fn()...)

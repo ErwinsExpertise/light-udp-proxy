@@ -20,6 +20,10 @@ A high-performance UDP proxy written in Go, designed to complement HAProxy in en
 | **Structured logging** | JSON log output at `debug`, `info`, `warn`, `error` levels |
 | **Packet validation** | Configurable per-frontend maximum packet size; oversized packets are dropped |
 | **Session limits** | Per-frontend maximum concurrent session cap |
+| **Traffic shaping** | Token-bucket shaping at global/frontend/backend/per-client levels |
+| **QoS priorities** | `critical`, `high`, `normal`, `low`, `bulk` frontend priorities |
+| **Abuse protection** | Lightweight per-IP packet-rate and active-session limits |
+| **Fragment handling** | Optional fragmented IPv4 packet dropping |
 
 ---
 
@@ -94,6 +98,12 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 | `socket.rcvbuf` | `0` | SO_RCVBUF kernel receive buffer in bytes (`0` = OS default) |
 | `socket.sndbuf` | `0` | SO_SNDBUF kernel send buffer in bytes (`0` = OS default) |
 | `socket.reuse_port` | `false` | SO_REUSEPORT (Linux): each worker goroutine gets its own socket for kernel-level multi-core distribution |
+| `traffic_shaping.*` | – | Global token-bucket shaping (`packets_per_second`, `bytes_per_second`, `burst_packets`) |
+| `client_limits.*` | – | Per-client IP shaping (`packets_per_second`, `burst_packets`) |
+| `abuse_protection.*` | – | Per-IP temporary flood protection (`max_packets_per_second_per_ip`, `max_sessions_per_ip`) |
+| `fragmentation.drop_fragments` | `false` | Drop IPv4 fragmented packets |
+
+`bytes_per_second` and `burst_bytes` accept suffixes: decimal (`KB`, `MB`, `GB`, `TB`) and binary (`KiB`, `MiB`, `GiB`, `TiB`).
 
 ### `frontends[]`
 
@@ -105,6 +115,8 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 | `session_affinity` | – | Sticky session routing (default `false`) |
 | `max_sessions` | – | Maximum concurrent sessions (`0` = unlimited) |
 | `max_packet_size` | – | Override global max packet size |
+| `priority` | – | `critical` \| `high` \| `normal` \| `low` \| `bulk` (default `normal`) |
+| `traffic_shaping.*` | – | Frontend-level token-bucket limits |
 
 ### `backends[]`
 
@@ -115,6 +127,7 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 | `health_check.enabled` | – | Enable periodic probes (default `false`) |
 | `health_check.interval` | – | Probe interval (default `10s`) |
 | `health_check.timeout` | – | Probe timeout (default `2s`) |
+| `traffic_shaping.*` | – | Backend-level token-bucket limits |
 | `servers[].address` | ✅ | `host:port` of the backend server |
 | `servers[].weight` | – | Relative weight for weighted load balancing (default `1`) |
 
@@ -129,6 +142,10 @@ The `/metrics` endpoint returns JSON:
   "packets_received": 1000000,
   "packets_forwarded": 999500,
   "packets_dropped": 500,
+  "packets_shaped": 120,
+  "packets_dropped_rate_limit": 230,
+  "packets_dropped_fragment": 40,
+  "packets_dropped_abuse": 70,
   "bytes_in": 524288000,
   "bytes_out": 524032000,
   "active_sessions": 4200,
@@ -154,15 +171,7 @@ A `/healthz` endpoint returns `ok` (HTTP 200) when the proxy process is alive.
 
 ## Releases
 
-Every push to `main` automatically:
-
-1. **Bumps the semver tag** using commit-message conventions:
-   - `feat:` → minor bump (e.g. `v1.1.0`)
-   - `fix:` / `perf:` → patch bump (e.g. `v1.0.1`)
-   - `BREAKING CHANGE` in commit body → major bump (e.g. `v2.0.0`)
-   - Anything else → patch bump (default)
-
-2. **Runs GoReleaser** to build and publish a GitHub Release with binaries for:
+Pushing a tag that matches `v*` runs GoReleaser to build and publish a GitHub Release with binaries for:
 
 | OS | Architectures |
 |---|---|
@@ -181,6 +190,10 @@ Each release includes SHA-256 checksums and a `config.example.yaml`.
 go test ./...
 ```
 
+## CI
+
+GitHub Actions CI runs formatting checks (`gofmt -l`), `go vet ./...`, and `go test ./... -count=1` on pushes and pull requests.
+
 ---
 
 ## Project Structure
@@ -194,6 +207,10 @@ internal/
   session/             # UDP session table with TTL expiry
   backend/             # Server pool, load-balancing algorithms
   frontend/            # UDP listener, packet routing
+  shaping/             # Token-bucket rate limiting
+  qos/                 # Frontend priority handling
+  abuse/               # Lightweight per-IP abuse protection
+  fragment/            # Fragment detection helpers
   healthcheck/         # Periodic UDP health probes
   metrics/             # HTTP /metrics JSON endpoint
   proxy/               # Top-level orchestrator, signal handling

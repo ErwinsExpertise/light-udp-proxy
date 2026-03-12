@@ -12,16 +12,36 @@ global:
   session_timeout: 30s
   log_level: debug
   metrics_addr: "127.0.0.1:9090"
+  traffic_shaping:
+    enabled: true
+    packets_per_second: 200000
+    bytes_per_second: 200MB
+    burst_packets: 50000
+  client_limits:
+    packets_per_second: 500
+    burst_packets: 100
+  abuse_protection:
+    enabled: true
+    max_packets_per_second_per_ip: 20000
+    max_sessions_per_ip: 200
+  fragmentation:
+    drop_fragments: true
 
 frontends:
   - name: test_fe
     listen: "0.0.0.0:9000"
     backend: test_be
     session_affinity: true
+    priority: high
+    traffic_shaping:
+      packets_per_second: 50000
+      burst_packets: 10000
 
 backends:
   - name: test_be
     load_balance: round_robin
+    traffic_shaping:
+      packets_per_second: 100000
     health_check:
       enabled: true
       interval: 5s
@@ -51,6 +71,19 @@ func TestParseValidConfig(t *testing.T) {
 	if cfg.Global.LogLevel != "debug" {
 		t.Errorf("LogLevel = %q, want debug", cfg.Global.LogLevel)
 	}
+	if !cfg.Global.TrafficShaping.Enabled {
+		t.Errorf("TrafficShaping.Enabled = false, want true")
+	}
+	wantBytesPerSecond := int64(200 * 1000 * 1000)
+	if int64(cfg.Global.TrafficShaping.BytesPerSecond) != wantBytesPerSecond {
+		t.Errorf("TrafficShaping.BytesPerSecond = %d, want %d", cfg.Global.TrafficShaping.BytesPerSecond, wantBytesPerSecond)
+	}
+	if cfg.Global.ClientLimits.PacketsPerSecond != 500 {
+		t.Errorf("ClientLimits.PacketsPerSecond = %d, want 500", cfg.Global.ClientLimits.PacketsPerSecond)
+	}
+	if !cfg.Global.Fragmentation.DropFragments {
+		t.Errorf("Fragmentation.DropFragments = false, want true")
+	}
 	if len(cfg.Frontends) != 1 {
 		t.Fatalf("len(Frontends) = %d, want 1", len(cfg.Frontends))
 	}
@@ -64,6 +97,12 @@ func TestParseValidConfig(t *testing.T) {
 	if !fe.SessionAffinity {
 		t.Errorf("Frontend.SessionAffinity = false, want true")
 	}
+	if fe.Priority != "high" {
+		t.Errorf("Frontend.Priority = %q, want high", fe.Priority)
+	}
+	if fe.TrafficShaping.PacketsPerSecond != 50000 {
+		t.Errorf("Frontend.TrafficShaping.PacketsPerSecond = %d, want 50000", fe.TrafficShaping.PacketsPerSecond)
+	}
 	if len(cfg.Backends) != 1 {
 		t.Fatalf("len(Backends) = %d, want 1", len(cfg.Backends))
 	}
@@ -73,6 +112,9 @@ func TestParseValidConfig(t *testing.T) {
 	}
 	if be.LoadBalance != "round_robin" {
 		t.Errorf("Backend.LoadBalance = %q, want round_robin", be.LoadBalance)
+	}
+	if be.TrafficShaping.PacketsPerSecond != 100000 {
+		t.Errorf("Backend.TrafficShaping.PacketsPerSecond = %d, want 100000", be.TrafficShaping.PacketsPerSecond)
 	}
 	if len(be.Servers) != 2 {
 		t.Fatalf("len(Servers) = %d, want 2", len(be.Servers))
@@ -114,6 +156,9 @@ backends:
 	}
 	if cfg.Backends[0].Servers[0].Weight != 1 {
 		t.Errorf("default Server.Weight = %d, want 1", cfg.Backends[0].Servers[0].Weight)
+	}
+	if cfg.Frontends[0].Priority != "normal" {
+		t.Errorf("default Frontend.Priority = %q, want normal", cfg.Frontends[0].Priority)
 	}
 }
 
@@ -178,5 +223,45 @@ backends:
 `))
 	if err == nil {
 		t.Fatal("expected error for invalid load_balance")
+	}
+}
+
+func TestValidateInvalidPriority(t *testing.T) {
+	_, err := Parse([]byte(`
+frontends:
+  - name: fe
+    listen: "0.0.0.0:1234"
+    backend: be
+    priority: urgent
+backends:
+  - name: be
+    servers:
+      - address: "127.0.0.1:5000"
+`))
+	if err == nil {
+		t.Fatal("expected error for invalid priority")
+	}
+}
+
+func TestParseByteSizeBinaryUnit(t *testing.T) {
+	cfg, err := Parse([]byte(`
+global:
+  traffic_shaping:
+    enabled: true
+    bytes_per_second: 2MiB
+frontends:
+  - name: fe
+    listen: "0.0.0.0:1234"
+    backend: be
+backends:
+  - name: be
+    servers:
+      - address: "127.0.0.1:5000"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := int64(cfg.Global.TrafficShaping.BytesPerSecond), int64(2*1024*1024); got != want {
+		t.Fatalf("bytes_per_second = %d, want %d", got, want)
 	}
 }

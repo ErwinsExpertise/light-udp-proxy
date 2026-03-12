@@ -8,12 +8,20 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/abuse"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/config"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/fragment"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/metrics"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/session"
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/shaping"
 )
+
+// fragmentOOBBufferSize is large enough to hold a few small IP control
+// messages (including IP_RECVFRAGSIZE) returned by recvmsg.
+const fragmentOOBBufferSize = 128
 
 // pkt is a forwarding work item passed from reader goroutines to forwarding workers.
 // The bufPtr field is owned by the work item until the worker returns it to the pool.
@@ -50,7 +58,24 @@ type Frontend struct {
 	// bufPool re-uses packet buffers to eliminate per-packet allocations.
 	bufPool sync.Pool
 
-	maxPacketSize int
+	maxPacketSize  int
+	globalShaper   *shaping.Bucket
+	frontendShaper *shaping.Bucket
+	backendShaper  *shaping.Bucket
+	clientShaper   *shaping.ClientLimiter
+	abuseProtector *abuse.Protector
+	dropFragments  bool
+	fragmentAware  bool
+}
+
+// RuntimeOptions configures packet policy for a frontend.
+type RuntimeOptions struct {
+	GlobalShaper   *shaping.Bucket
+	FrontendShaper *shaping.Bucket
+	BackendShaper  *shaping.Bucket
+	ClientShaper   *shaping.ClientLimiter
+	AbuseProtector *abuse.Protector
+	DropFragments  bool
 }
 
 // New creates a Frontend.
@@ -60,19 +85,26 @@ func New(
 	sessions *session.Table,
 	counters *metrics.Counters,
 	maxPacketSize int,
+	opts RuntimeOptions,
 	log *slog.Logger,
 ) *Frontend {
 	if cfg.MaxPacketSize > 0 {
 		maxPacketSize = cfg.MaxPacketSize
 	}
 	f := &Frontend{
-		cfg:           cfg,
-		pool:          pool,
-		sessions:      sessions,
-		counters:      counters,
-		log:           log,
-		stopCh:        make(chan struct{}),
-		maxPacketSize: maxPacketSize,
+		cfg:            cfg,
+		pool:           pool,
+		sessions:       sessions,
+		counters:       counters,
+		log:            log,
+		stopCh:         make(chan struct{}),
+		maxPacketSize:  maxPacketSize,
+		globalShaper:   opts.GlobalShaper,
+		frontendShaper: opts.FrontendShaper,
+		backendShaper:  opts.BackendShaper,
+		clientShaper:   opts.ClientShaper,
+		abuseProtector: opts.AbuseProtector,
+		dropFragments:  opts.DropFragments,
 	}
 	f.bufPool = sync.Pool{
 		New: func() any {
@@ -123,6 +155,19 @@ func (f *Frontend) Start(workerCount int, socketCfg config.SocketConfig) error {
 			return fmt.Errorf("frontend %q: listen: %w", f.cfg.Name, err)
 		}
 		f.listenConns = append(f.listenConns, pc.(*net.UDPConn))
+	}
+	if f.dropFragments {
+		f.fragmentAware = true
+		for _, c := range f.listenConns {
+			if !fragment.EnableDetection(c) {
+				f.fragmentAware = false
+				break
+			}
+		}
+		if !f.fragmentAware {
+			f.log.Warn("fragment dropping requested but ancillary fragment detection is unavailable; packets will not be dropped",
+				"frontend", f.cfg.Name)
+		}
 	}
 
 	// Shared outbound socket for forwarding workers.
@@ -212,7 +257,18 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 		bufPtr := f.bufPool.Get().(*[]byte)
 		buf := *bufPtr
 
-		n, clientAddr, err := conn.ReadFromUDPAddrPort(buf)
+		var (
+			n          int
+			clientAddr netip.AddrPort
+			err        error
+			oobN       int
+		)
+		var oob [fragmentOOBBufferSize]byte
+		if f.dropFragments && f.fragmentAware {
+			n, oobN, _, clientAddr, err = conn.ReadMsgUDPAddrPort(buf, oob[:])
+		} else {
+			n, clientAddr, err = conn.ReadFromUDPAddrPort(buf)
+		}
 		if err != nil {
 			f.bufPool.Put(bufPtr)
 			select {
@@ -237,6 +293,28 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 				"client", clientAddr,
 				"size", n,
 				"max", f.maxPacketSize)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
+		if f.dropFragments && f.fragmentAware && fragment.IsFragmentedOOB(oob[:oobN]) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsDroppedFragment.Add(1)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
+		now := time.Now()
+		if !f.allowShaped(clientAddr, n, now) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsShaped.Add(1)
+			f.counters.PacketsDroppedRateLimit.Add(1)
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+		if f.abuseProtector != nil && !f.abuseProtector.Allow(clientAddr, now) {
+			f.counters.PacketsDropped.Add(1)
+			f.counters.PacketsDroppedAbuse.Add(1)
 			f.bufPool.Put(bufPtr)
 			continue
 		}
@@ -352,6 +430,12 @@ func (f *Frontend) forward(p pkt) {
 	}
 
 	// Use WriteToUDPAddrPort for a zero-allocation send path.
+	if f.backendShaper != nil && !f.backendShaper.Allow(p.n, time.Now()) {
+		f.counters.PacketsDropped.Add(1)
+		f.counters.PacketsShaped.Add(1)
+		f.counters.PacketsDroppedRateLimit.Add(1)
+		return
+	}
 	if _, err := f.sendConn.WriteToUDPAddrPort(payload, srv.AddrPort()); err != nil {
 		f.counters.PacketsDropped.Add(1)
 		f.log.Debug("send error", "frontend", f.cfg.Name, "backend", srv.Address, "err", err)
@@ -360,4 +444,17 @@ func (f *Frontend) forward(p pkt) {
 
 	f.counters.PacketsForwarded.Add(1)
 	f.counters.BytesOut.Add(int64(p.n))
+}
+
+func (f *Frontend) allowShaped(clientAddr netip.AddrPort, packetSize int, now time.Time) bool {
+	if f.globalShaper != nil && !f.globalShaper.Allow(packetSize, now) {
+		return false
+	}
+	if f.frontendShaper != nil && !f.frontendShaper.Allow(packetSize, now) {
+		return false
+	}
+	if f.clientShaper != nil && !f.clientShaper.Allow(clientAddr.Addr(), packetSize, now) {
+		return false
+	}
+	return true
 }

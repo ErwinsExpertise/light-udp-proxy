@@ -4,8 +4,11 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/ErwinsExpertise/light-udp-proxy/internal/qos"
 	"gopkg.in/yaml.v3"
 )
 
@@ -18,13 +21,17 @@ type Config struct {
 
 // GlobalConfig contains global proxy settings.
 type GlobalConfig struct {
-	MaxPacketSize          int           `yaml:"max_packet_size"`
-	WorkerThreads          int           `yaml:"worker_threads"`
-	SessionTimeout         time.Duration `yaml:"session_timeout"`
-	SessionCleanupInterval time.Duration `yaml:"session_cleanup_interval"`
-	LogLevel               string        `yaml:"log_level"`
-	MetricsAddr            string        `yaml:"metrics_addr"`
-	Socket                 SocketConfig  `yaml:"socket"`
+	MaxPacketSize          int                   `yaml:"max_packet_size"`
+	WorkerThreads          int                   `yaml:"worker_threads"`
+	SessionTimeout         time.Duration         `yaml:"session_timeout"`
+	SessionCleanupInterval time.Duration         `yaml:"session_cleanup_interval"`
+	LogLevel               string                `yaml:"log_level"`
+	MetricsAddr            string                `yaml:"metrics_addr"`
+	Socket                 SocketConfig          `yaml:"socket"`
+	TrafficShaping         TrafficShapingConfig  `yaml:"traffic_shaping"`
+	ClientLimits           ClientLimitsConfig    `yaml:"client_limits"`
+	AbuseProtection        AbuseProtectionConfig `yaml:"abuse_protection"`
+	Fragmentation          FragmentationConfig   `yaml:"fragmentation"`
 }
 
 // SocketConfig holds kernel-level socket tuning options.
@@ -40,20 +47,115 @@ type SocketConfig struct {
 
 // FrontendConfig defines a listening frontend.
 type FrontendConfig struct {
-	Name            string `yaml:"name"`
-	Listen          string `yaml:"listen"`
-	Backend         string `yaml:"backend"`
-	SessionAffinity bool   `yaml:"session_affinity"`
-	MaxSessions     int    `yaml:"max_sessions"`    // max concurrent sessions, 0 = unlimited
-	MaxPacketSize   int    `yaml:"max_packet_size"` // override global, 0 = use global
+	Name            string               `yaml:"name"`
+	Listen          string               `yaml:"listen"`
+	Backend         string               `yaml:"backend"`
+	SessionAffinity bool                 `yaml:"session_affinity"`
+	MaxSessions     int                  `yaml:"max_sessions"`    // max concurrent sessions, 0 = unlimited
+	MaxPacketSize   int                  `yaml:"max_packet_size"` // override global, 0 = use global
+	Priority        string               `yaml:"priority"`
+	TrafficShaping  TrafficShapingConfig `yaml:"traffic_shaping"`
 }
 
 // BackendConfig defines a pool of servers.
 type BackendConfig struct {
-	Name        string            `yaml:"name"`
-	LoadBalance string            `yaml:"load_balance"`
-	HealthCheck HealthCheckConfig `yaml:"health_check"`
-	Servers     []ServerConfig    `yaml:"servers"`
+	Name           string               `yaml:"name"`
+	LoadBalance    string               `yaml:"load_balance"`
+	HealthCheck    HealthCheckConfig    `yaml:"health_check"`
+	Servers        []ServerConfig       `yaml:"servers"`
+	TrafficShaping TrafficShapingConfig `yaml:"traffic_shaping"`
+}
+
+// ByteSize stores a size in bytes and supports YAML values like "200MB".
+type ByteSize int64
+
+// UnmarshalYAML parses byte-size values from YAML.
+func (b *ByteSize) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		if value.Tag == "!!int" {
+			n, err := strconv.ParseInt(value.Value, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid byte size %q: %w", value.Value, err)
+			}
+			*b = ByteSize(n)
+			return nil
+		}
+		n, err := parseByteSize(value.Value)
+		if err != nil {
+			return err
+		}
+		*b = ByteSize(n)
+		return nil
+	default:
+		return fmt.Errorf("invalid byte size value %q", value.Value)
+	}
+}
+
+func parseByteSize(value string) (int64, error) {
+	s := strings.TrimSpace(value)
+	if s == "" {
+		return 0, nil
+	}
+	end := len(s)
+	for end > 0 && ((s[end-1] >= 'A' && s[end-1] <= 'Z') || (s[end-1] >= 'a' && s[end-1] <= 'z')) {
+		end--
+	}
+	numPart := strings.TrimSpace(s[:end])
+	unitPart := strings.ToUpper(strings.TrimSpace(s[end:]))
+	n, err := strconv.ParseInt(numPart, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid byte size %q: %w", value, err)
+	}
+	switch unitPart {
+	case "", "B":
+		return n, nil
+	case "KB":
+		return n * 1000, nil
+	case "MB":
+		return n * 1000 * 1000, nil
+	case "GB":
+		return n * 1000 * 1000 * 1000, nil
+	case "TB":
+		return n * 1000 * 1000 * 1000 * 1000, nil
+	case "KIB":
+		return n * 1024, nil
+	case "MIB":
+		return n * 1024 * 1024, nil
+	case "GIB":
+		return n * 1024 * 1024 * 1024, nil
+	case "TIB":
+		return n * 1024 * 1024 * 1024 * 1024, nil
+	default:
+		return 0, fmt.Errorf("unsupported byte size unit %q", unitPart)
+	}
+}
+
+// TrafficShapingConfig configures token-bucket shaping.
+type TrafficShapingConfig struct {
+	Enabled          bool     `yaml:"enabled"`
+	PacketsPerSecond int64    `yaml:"packets_per_second"`
+	BytesPerSecond   ByteSize `yaml:"bytes_per_second"`
+	BurstPackets     int64    `yaml:"burst_packets"`
+	BurstBytes       ByteSize `yaml:"burst_bytes"`
+}
+
+// ClientLimitsConfig configures per-client shaping.
+type ClientLimitsConfig struct {
+	PacketsPerSecond int64 `yaml:"packets_per_second"`
+	BurstPackets     int64 `yaml:"burst_packets"`
+}
+
+// AbuseProtectionConfig configures temporary per-IP abuse limits.
+type AbuseProtectionConfig struct {
+	Enabled                  bool  `yaml:"enabled"`
+	MaxPacketsPerSecondPerIP int64 `yaml:"max_packets_per_second_per_ip"`
+	MaxSessionsPerIP         int   `yaml:"max_sessions_per_ip"`
+}
+
+// FragmentationConfig configures packet fragment handling.
+type FragmentationConfig struct {
+	DropFragments bool `yaml:"drop_fragments"`
 }
 
 // HealthCheckConfig controls periodic backend health checks.
@@ -88,6 +190,11 @@ func (c *Config) defaults() {
 	}
 	if c.Global.MetricsAddr == "" {
 		c.Global.MetricsAddr = "0.0.0.0:9090"
+	}
+	for i := range c.Frontends {
+		if c.Frontends[i].Priority == "" {
+			c.Frontends[i].Priority = qos.PriorityNormal.String()
+		}
 	}
 	for i := range c.Backends {
 		if c.Backends[i].LoadBalance == "" {
@@ -153,6 +260,9 @@ func (c *Config) validate() error {
 		}
 		if _, ok := backendNames[f.Backend]; !ok {
 			return fmt.Errorf("frontend %q references unknown backend %q", f.Name, f.Backend)
+		}
+		if _, err := qos.ParsePriority(f.Priority); err != nil {
+			return fmt.Errorf("frontend %q: %w", f.Name, err)
 		}
 		if _, dup := frontendNames[f.Name]; dup {
 			return fmt.Errorf("duplicate frontend name %q", f.Name)
