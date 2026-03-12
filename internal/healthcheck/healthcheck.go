@@ -13,9 +13,9 @@ import (
 
 // Checker runs periodic health checks for a backend pool.
 type Checker struct {
-	pool     *backend.Pool
-	cfg      config.HealthCheckConfig
-	log      *slog.Logger
+	pool *backend.Pool
+	cfg  config.HealthCheckConfig
+	log  *slog.Logger
 }
 
 // New creates a Checker for the given pool.
