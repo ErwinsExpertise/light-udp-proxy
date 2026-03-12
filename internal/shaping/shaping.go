@@ -140,7 +140,7 @@ func (cl *ClientLimiter) Allow(addr netip.Addr, n int, now time.Time) bool {
 	if cl == nil || !cl.enabled {
 		return true
 	}
-	idx := int(addr.As16()[15]) % len(cl.shards)
+	idx := int(addr.As16()[14]^addr.As16()[15]) % len(cl.shards)
 	sh := &cl.shards[idx]
 	nowUnix := now.Unix()
 

@@ -74,7 +74,7 @@ func TestParseValidConfig(t *testing.T) {
 	if !cfg.Global.TrafficShaping.Enabled {
 		t.Errorf("TrafficShaping.Enabled = false, want true")
 	}
-	wantBytesPerSecond := int64(200 * 1024 * 1024)
+	wantBytesPerSecond := int64(200 * 1000 * 1000)
 	if int64(cfg.Global.TrafficShaping.BytesPerSecond) != wantBytesPerSecond {
 		t.Errorf("TrafficShaping.BytesPerSecond = %d, want %d", cfg.Global.TrafficShaping.BytesPerSecond, wantBytesPerSecond)
 	}
@@ -240,5 +240,28 @@ backends:
 `))
 	if err == nil {
 		t.Fatal("expected error for invalid priority")
+	}
+}
+
+func TestParseByteSizeBinaryUnit(t *testing.T) {
+	cfg, err := Parse([]byte(`
+global:
+  traffic_shaping:
+    enabled: true
+    bytes_per_second: 2MiB
+frontends:
+  - name: fe
+    listen: "0.0.0.0:1234"
+    backend: be
+backends:
+  - name: be
+    servers:
+      - address: "127.0.0.1:5000"
+`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := int64(cfg.Global.TrafficShaping.BytesPerSecond), int64(2*1024*1024); got != want {
+		t.Fatalf("bytes_per_second = %d, want %d", got, want)
 	}
 }

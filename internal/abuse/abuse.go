@@ -23,8 +23,9 @@ type entry struct {
 }
 
 type shard struct {
-	mu      sync.Mutex
-	entries map[netip.Addr]*entry
+	mu        sync.Mutex
+	entries   map[netip.Addr]*entry
+	lastSweep int64
 }
 
 // Protector tracks per-IP traffic and active sessions.
@@ -80,7 +81,10 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 		}
 		e.packets++
 		if e.packets > p.cfg.MaxPacketsPerSecond {
-			p.sweepLocked(sh, now)
+			if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+				p.sweepLocked(sh, now)
+				sh.lastSweep = nowSec
+			}
 			return false
 		}
 	}
@@ -93,12 +97,18 @@ func (p *Protector) Allow(addr netip.AddrPort, now time.Time) bool {
 			e.lastSweep = nowSec
 		}
 		if len(e.sessions) > p.cfg.MaxSessionsPerClient {
-			p.sweepLocked(sh, now)
+			if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+				p.sweepLocked(sh, now)
+				sh.lastSweep = nowSec
+			}
 			return false
 		}
 	}
 
-	p.sweepLocked(sh, now)
+	if nowSec-sh.lastSweep >= int64(p.cfg.SessionTTL.Seconds()) {
+		p.sweepLocked(sh, now)
+		sh.lastSweep = nowSec
+	}
 	return true
 }
 

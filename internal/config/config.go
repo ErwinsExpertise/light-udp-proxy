@@ -110,13 +110,21 @@ func parseByteSize(value string) (int64, error) {
 	switch unitPart {
 	case "", "B":
 		return n, nil
-	case "KB", "KIB":
+	case "KB":
+		return n * 1000, nil
+	case "MB":
+		return n * 1000 * 1000, nil
+	case "GB":
+		return n * 1000 * 1000 * 1000, nil
+	case "TB":
+		return n * 1000 * 1000 * 1000 * 1000, nil
+	case "KIB":
 		return n * 1024, nil
-	case "MB", "MIB":
+	case "MIB":
 		return n * 1024 * 1024, nil
-	case "GB", "GIB":
+	case "GIB":
 		return n * 1024 * 1024 * 1024, nil
-	case "TB", "TIB":
+	case "TIB":
 		return n * 1024 * 1024 * 1024 * 1024, nil
 	default:
 		return 0, fmt.Errorf("unsupported byte size unit %q", unitPart)

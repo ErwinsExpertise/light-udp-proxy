@@ -23,6 +23,7 @@ global:
   traffic_shaping:
     enabled: true
     packets_per_second: 200000
+    # Units: KB/MB/GB/TB are decimal; KiB/MiB/GiB/TiB are binary.
     bytes_per_second: 200MB
     burst_packets: 50000
 

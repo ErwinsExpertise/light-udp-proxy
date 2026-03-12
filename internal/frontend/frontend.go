@@ -61,6 +61,7 @@ type Frontend struct {
 	clientShaper   *shaping.ClientLimiter
 	abuseProtector *abuse.Protector
 	dropFragments  bool
+	fragmentAware  bool
 }
 
 // RuntimeOptions configures packet policy for a frontend.
@@ -151,6 +152,19 @@ func (f *Frontend) Start(workerCount int, socketCfg config.SocketConfig) error {
 		}
 		f.listenConns = append(f.listenConns, pc.(*net.UDPConn))
 	}
+	if f.dropFragments {
+		f.fragmentAware = true
+		for _, c := range f.listenConns {
+			if !fragment.EnableDetection(c) {
+				f.fragmentAware = false
+				break
+			}
+		}
+		if !f.fragmentAware {
+			f.log.Warn("fragment dropping requested but ancillary fragment detection is unavailable; packets will not be dropped",
+				"frontend", f.cfg.Name)
+		}
+	}
 
 	// Shared outbound socket for forwarding workers.
 	sendPC, err := lc.ListenPacket(context.Background(), "udp", "")
@@ -239,7 +253,18 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 		bufPtr := f.bufPool.Get().(*[]byte)
 		buf := *bufPtr
 
-		n, clientAddr, err := conn.ReadFromUDPAddrPort(buf)
+		var (
+			n          int
+			clientAddr netip.AddrPort
+			err        error
+			oobN       int
+		)
+		var oob [128]byte
+		if f.dropFragments && f.fragmentAware {
+			n, oobN, _, clientAddr, err = conn.ReadMsgUDPAddrPort(buf, oob[:])
+		} else {
+			n, clientAddr, err = conn.ReadFromUDPAddrPort(buf)
+		}
 		if err != nil {
 			f.bufPool.Put(bufPtr)
 			select {
@@ -268,7 +293,7 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 			continue
 		}
 
-		if f.dropFragments && fragment.IsFragmentedIPv4(buf[:n]) {
+		if f.dropFragments && f.fragmentAware && fragment.IsFragmentedOOB(oob[:oobN]) {
 			f.counters.PacketsDropped.Add(1)
 			f.counters.PacketsDroppedFragment.Add(1)
 			f.bufPool.Put(bufPtr)

@@ -103,6 +103,8 @@ See [config.example.yaml](config.example.yaml) for a fully annotated example.
 | `abuse_protection.*` | – | Per-IP temporary flood protection (`max_packets_per_second_per_ip`, `max_sessions_per_ip`) |
 | `fragmentation.drop_fragments` | `false` | Drop IPv4 fragmented packets |
 
+`bytes_per_second` and `burst_bytes` accept suffixes: decimal (`KB`, `MB`, `GB`, `TB`) and binary (`KiB`, `MiB`, `GiB`, `TiB`).
+
 ### `frontends[]`
 
 | Key | Required | Description |
@@ -169,15 +171,7 @@ A `/healthz` endpoint returns `ok` (HTTP 200) when the proxy process is alive.
 
 ## Releases
 
-Every push to `main` automatically:
-
-1. **Bumps the semver tag** using commit-message conventions:
-   - `feat:` → minor bump (e.g. `v1.1.0`)
-   - `fix:` / `perf:` → patch bump (e.g. `v1.0.1`)
-   - `BREAKING CHANGE` in commit body → major bump (e.g. `v2.0.0`)
-   - Anything else → patch bump (default)
-
-2. **Runs GoReleaser** to build and publish a GitHub Release with binaries for:
+Pushing a tag that matches `v*` runs GoReleaser to build and publish a GitHub Release with binaries for:
 
 | OS | Architectures |
 |---|---|
@@ -195,6 +189,10 @@ Each release includes SHA-256 checksums and a `config.example.yaml`.
 ```bash
 go test ./...
 ```
+
+## CI
+
+GitHub Actions CI runs formatting checks (`gofmt -l`), `go vet ./...`, and `go test ./... -count=1` on pushes and pull requests.
 
 ---
 

@@ -172,7 +172,7 @@ t.Fatal("expected rate-limit drop counter increment")
 }
 }
 
-func TestFrontendDropsFragmentsWhenEnabled(t *testing.T) {
+func TestFrontendFragmentHandlingNoPayloadFalsePositive(t *testing.T) {
 fe, counters := newTestFrontendWithOptions(t, "127.0.0.1:0", "127.0.0.1:9999", frontend.RuntimeOptions{
 DropFragments: true,
 })
@@ -186,16 +186,16 @@ if err != nil {
 t.Fatalf("client dial: %v", err)
 }
 defer clientConn.Close()
-fragmentedIPv4Packet := []byte{
+payload := []byte{
 0x45, 0x00, 0x00, 0x14, 0x00, 0x01, 0x20, 0x00,
 0x40, 0x11, 0x00, 0x00, 0x7f, 0x00, 0x00, 0x01,
 0x7f, 0x00, 0x00, 0x01,
 }
-if _, err := clientConn.Write(fragmentedIPv4Packet); err != nil {
+if _, err := clientConn.Write(payload); err != nil {
 t.Fatalf("client write: %v", err)
 }
 time.Sleep(100 * time.Millisecond)
-if counters.PacketsDroppedFragment.Load() == 0 {
-t.Fatal("expected fragment drops")
+if counters.PacketsDroppedFragment.Load() != 0 {
+	t.Fatal("expected no fragment drops for normal UDP payload data")
 }
 }
