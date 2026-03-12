@@ -1,0 +1,100 @@
+global:
+  # Maximum size of a single UDP datagram accepted
+  max_packet_size: 65535
+
+  # Number of goroutines per frontend performing packet reads.
+  # When socket.reuse_port is true, each worker gets its own socket and the
+  # kernel distributes packets across them for true multi-core scaling.
+  worker_threads: 8
+
+  # Idle session timeout; sessions are removed if no packet is seen in this window
+  session_timeout: 60s
+
+  # How often the session reaper sweeps for expired sessions
+  session_cleanup_interval: 10s
+
+  # Log verbosity: debug | info | warn | error
+  log_level: info
+
+  # HTTP metrics endpoint address
+  metrics_addr: "0.0.0.0:9090"
+
+  # Kernel-level socket tuning (applied via net.ListenConfig before bind)
+  socket:
+    # SO_RCVBUF — kernel receive buffer per socket in bytes (0 = OS default)
+    rcvbuf: 8388608   # 8 MiB
+    # SO_SNDBUF — kernel send buffer per socket in bytes (0 = OS default)
+    sndbuf: 8388608   # 8 MiB
+    # SO_REUSEPORT — Linux only; lets each worker goroutine own a separate socket
+    # so the kernel load-balances datagrams across cores without contention.
+    reuse_port: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Frontends
+# Each frontend binds a UDP port and routes traffic to a named backend.
+# ──────────────────────────────────────────────────────────────────────────────
+frontends:
+  - name: game_udp
+    # Bind address:port for this frontend
+    listen: "0.0.0.0:27015"
+    # Name of the backend pool to use
+    backend: game_servers
+    # Sticky sessions: once a client is assigned to a server, all subsequent
+    # packets from that client go to the same server (within session_timeout)
+    session_affinity: true
+    # Maximum concurrent sessions (0 = unlimited)
+    max_sessions: 10000
+
+  - name: voip_udp
+    listen: "0.0.0.0:5060"
+    backend: voip_servers
+    session_affinity: true
+
+  - name: media_udp
+    listen: "0.0.0.0:5004"
+    backend: media_servers
+    session_affinity: false
+    # Per-frontend packet size override (0 = use global)
+    max_packet_size: 1500
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Backends
+# Each backend defines a server pool and how load is distributed.
+# ──────────────────────────────────────────────────────────────────────────────
+backends:
+  - name: game_servers
+    # Load balancing algorithm: round_robin | least_conn | random | hash
+    load_balance: round_robin
+    health_check:
+      enabled: true
+      interval: 5s
+      timeout: 2s
+    servers:
+      - address: "10.0.0.10:27015"
+        weight: 1
+      - address: "10.0.0.11:27015"
+        weight: 1
+      - address: "10.0.0.12:27015"
+        weight: 2   # receives twice as many packets
+
+  - name: voip_servers
+    load_balance: least_conn
+    health_check:
+      enabled: true
+      interval: 10s
+      timeout: 2s
+    servers:
+      - address: "10.0.1.10:5060"
+        weight: 1
+      - address: "10.0.1.11:5060"
+        weight: 1
+
+  - name: media_servers
+    load_balance: hash   # consistent hashing by client IP
+    health_check:
+      enabled: false
+    servers:
+      - address: "10.0.2.10:5004"
+        weight: 1
+      - address: "10.0.2.11:5004"
+        weight: 1
