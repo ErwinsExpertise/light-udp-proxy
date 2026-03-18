@@ -41,6 +41,11 @@ type Session struct {
 	// PacketCount and ByteCount are updated with atomic.Add on every packet.
 	PacketCount atomic.Int64
 	ByteCount   atomic.Int64
+
+	// ConnIndex stores the frontend listener socket index this client most
+	// recently used. It is used for routing response packets through the same
+	// listener path in environments behind L4 load balancers/NAT.
+	ConnIndex atomic.Int32
 }
 
 // NewSession creates a Session targeting backendAddr.
@@ -48,6 +53,7 @@ func NewSession(backendAddr string) *Session {
 	s := &Session{}
 	s.binding.Store(&serverBinding{addr: backendAddr})
 	s.LastSeen.Store(time.Now().UnixNano())
+	s.ConnIndex.Store(-1)
 	return s
 }
 
@@ -71,6 +77,11 @@ func (s *Session) Touch(bytes int64) {
 	s.LastSeen.Store(time.Now().UnixNano())
 	s.PacketCount.Add(1)
 	s.ByteCount.Add(bytes)
+}
+
+// SetConnIndex records the listener socket index for response routing.
+func (s *Session) SetConnIndex(idx int32) {
+	s.ConnIndex.Store(idx)
 }
 
 // callEvict invokes the eviction callback registered via UpdateServer.
@@ -221,9 +232,10 @@ func (t *Table) Count() int64 {
 
 // FindMostRecentClientByBackend returns the most recently touched client address
 // for the given frontend/backend pair.
-func (t *Table) FindMostRecentClientByBackend(frontendName, backendAddr string) (netip.AddrPort, bool) {
+func (t *Table) FindMostRecentClientByBackend(frontendName, backendAddr string) (Key, int, bool) {
 	var (
-		bestAddr netip.AddrPort
+		bestKey  Key
+		bestConn int
 		bestSeen int64
 		found    bool
 	)
@@ -237,13 +249,14 @@ func (t *Table) FindMostRecentClientByBackend(frontendName, backendAddr string) 
 			lastSeen := sess.LastSeen.Load()
 			if !found || lastSeen > bestSeen {
 				bestSeen = lastSeen
-				bestAddr = key.Addr
+				bestKey = key
+				bestConn = int(sess.ConnIndex.Load())
 				found = true
 			}
 		}
 		s.mu.RUnlock()
 	}
-	return bestAddr, found
+	return bestKey, bestConn, found
 }
 
 // reaper runs at cleanupInterval and evicts expired sessions.

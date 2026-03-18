@@ -29,6 +29,7 @@ type pkt struct {
 	clientAddr netip.AddrPort // no-alloc address from ReadFromUDPAddrPort
 	bufPtr     *[]byte        // buffer from sync.Pool; returned after send
 	n          int            // number of valid bytes in *bufPtr
+	connIndex  int            // listener socket index the packet arrived on
 }
 
 // Frontend listens on a UDP port and proxies packets to a backend pool.
@@ -205,9 +206,10 @@ func (f *Frontend) Start(workerCount int, socketCfg config.SocketConfig) error {
 	// Start reader goroutines. If there are multiple listener sockets (SO_REUSEPORT),
 	// each reader is pinned to its own socket; otherwise all readers share one socket.
 	for i := 0; i < workerCount; i++ {
-		conn := f.listenConns[i%len(f.listenConns)]
+		connIndex := i % len(f.listenConns)
+		conn := f.listenConns[connIndex]
 		f.wg.Add(1)
-		go f.readLoop(conn)
+		go f.readLoop(conn, connIndex)
 	}
 
 	return nil
@@ -246,7 +248,7 @@ func (f *Frontend) closeListeners() {
 
 // readLoop reads datagrams from conn and enqueues them for forwarding workers.
 // It uses ReadFromUDPAddrPort to obtain the client address without heap allocation.
-func (f *Frontend) readLoop(conn *net.UDPConn) {
+func (f *Frontend) readLoop(conn *net.UDPConn, connIndex int) {
 	defer f.wg.Done()
 
 	for {
@@ -334,7 +336,7 @@ func (f *Frontend) readLoop(conn *net.UDPConn) {
 
 		// Zero-copy: transfer buffer ownership to the work item.
 		// The forwarding worker returns bufPtr to the pool after sending.
-		p := pkt{clientAddr: clientAddr, bufPtr: bufPtr, n: n}
+		p := pkt{clientAddr: clientAddr, bufPtr: bufPtr, n: n, connIndex: connIndex}
 		select {
 		case f.workCh <- p:
 		default:
@@ -448,6 +450,7 @@ func (f *Frontend) forward(p pkt) {
 		}
 		sess.Touch(int64(p.n))
 	}
+	sess.SetConnIndex(int32(p.connIndex))
 
 	// Use WriteToUDPAddrPort for a zero-allocation send path.
 	if f.backendShaper != nil && !f.backendShaper.Allow(p.n, time.Now()) {
@@ -494,21 +497,69 @@ func (f *Frontend) backendReadLoop() {
 
 		srv := f.pool.ServerByAddrPort(backendAddr)
 		if srv == nil {
+			f.log.Debug("dropping backend response from unknown source",
+				"frontend", f.cfg.Name,
+				"backend", backendAddr)
 			f.bufPool.Put(bufPtr)
 			continue
 		}
 
-		clientAddr, ok := f.sessions.FindMostRecentClientByBackend(f.cfg.Name, srv.Address)
+		clientKey, connIndex, ok := f.sessions.FindMostRecentClientByBackend(f.cfg.Name, srv.Address)
 		if !ok {
+			f.log.Debug("dropping backend response with no matching client session",
+				"frontend", f.cfg.Name,
+				"backend", srv.Address)
 			f.bufPool.Put(bufPtr)
 			continue
 		}
-
-		if _, err := f.listenConns[0].WriteToUDPAddrPort(buf[:n], clientAddr); err != nil {
-			f.log.Debug("client send error", "frontend", f.cfg.Name, "client", clientAddr, "err", err)
+		conn := f.listenerForIndex(connIndex)
+		if conn == nil {
+			conn = f.listenerForClient(clientKey.Addr)
+		}
+		if conn == nil {
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+		if _, err := conn.WriteToUDPAddrPort(buf[:n], clientKey.Addr); err != nil {
+			f.log.Debug("client send error", "frontend", f.cfg.Name, "client", clientKey.Addr, "err", err)
 		}
 		f.bufPool.Put(bufPtr)
 	}
+}
+
+func (f *Frontend) listenerForIndex(connIndex int) *net.UDPConn {
+	if connIndex < 0 || connIndex >= len(f.listenConns) {
+		return nil
+	}
+	return f.listenConns[connIndex]
+}
+
+// listenerForClient picks a listener socket deterministically from the client
+// address, so response packets use a stable socket when SO_REUSEPORT is enabled.
+func (f *Frontend) listenerForClient(clientAddr netip.AddrPort) *net.UDPConn {
+	if len(f.listenConns) == 0 {
+		return nil
+	}
+	if len(f.listenConns) == 1 {
+		return f.listenConns[0]
+	}
+	const (
+		// FNV-1a 32-bit constants for deterministic client->socket mapping.
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	ip := clientAddr.Addr().As16()
+	for _, b := range ip {
+		h ^= uint32(b)
+		h *= prime32
+	}
+	port := clientAddr.Port()
+	h ^= uint32(port >> 8)
+	h *= prime32
+	h ^= uint32(port & 0xff)
+	h *= prime32
+	return f.listenConns[int(h)%len(f.listenConns)]
 }
 
 func (f *Frontend) allowShaped(clientAddr netip.AddrPort, packetSize int, now time.Time) bool {

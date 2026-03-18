@@ -259,15 +259,21 @@ func TestFindMostRecentClientByBackend(t *testing.T) {
 	newerSess.LastSeen.Store(time.Now().UnixNano())
 	tbl.GetOrCreate(otherFrontend, func() *Session { return NewSession("10.0.0.1:9000") })
 
-	got, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.1:9000")
+	olderSess.SetConnIndex(1)
+	newerSess.SetConnIndex(3)
+
+	got, connIndex, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.1:9000")
 	if !ok {
 		t.Fatal("expected client to be found")
 	}
-	if got != newer.Addr {
-		t.Fatalf("FindMostRecentClientByBackend = %v, want %v", got, newer.Addr)
+	if got.Addr != newer.Addr {
+		t.Fatalf("FindMostRecentClientByBackend addr = %v, want %v", got.Addr, newer.Addr)
+	}
+	if connIndex != 3 {
+		t.Fatalf("FindMostRecentClientByBackend connIndex = %d, want 3", connIndex)
 	}
 
-	if _, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.2:9000"); ok {
+	if _, _, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.2:9000"); ok {
 		t.Fatal("expected no client for unknown backend")
 	}
 }
