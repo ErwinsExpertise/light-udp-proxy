@@ -244,3 +244,30 @@ func TestSharding(t *testing.T) {
 		}
 	}
 }
+
+func TestFindMostRecentClientByBackend(t *testing.T) {
+	tbl := NewTable(time.Minute, 10*time.Second)
+	defer tbl.Stop()
+
+	older := makeKey("127.0.0.1:1001", "fe")
+	newer := makeKey("127.0.0.1:1002", "fe")
+	otherFrontend := makeKey("127.0.0.1:1003", "other-fe")
+
+	olderSess, _ := tbl.GetOrCreate(older, func() *Session { return NewSession("10.0.0.1:9000") })
+	olderSess.LastSeen.Store(time.Now().Add(-time.Second).UnixNano())
+	newerSess, _ := tbl.GetOrCreate(newer, func() *Session { return NewSession("10.0.0.1:9000") })
+	newerSess.LastSeen.Store(time.Now().UnixNano())
+	tbl.GetOrCreate(otherFrontend, func() *Session { return NewSession("10.0.0.1:9000") })
+
+	got, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.1:9000")
+	if !ok {
+		t.Fatal("expected client to be found")
+	}
+	if got != newer.Addr {
+		t.Fatalf("FindMostRecentClientByBackend = %v, want %v", got, newer.Addr)
+	}
+
+	if _, ok := tbl.FindMostRecentClientByBackend("fe", "10.0.0.2:9000"); ok {
+		t.Fatal("expected no client for unknown backend")
+	}
+}

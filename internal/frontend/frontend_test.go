@@ -97,6 +97,19 @@ func TestFrontendForwardsPacket(t *testing.T) {
 		t.Fatalf("client write: %v", err)
 	}
 
+	// The backend echoes back to proxy; proxy must forward response to client.
+	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	got := make([]byte, len(payload))
+	n, err := clientConn.Read(got)
+	if err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if string(got[:n]) != string(payload) {
+		t.Fatalf("unexpected response: got %q want %q", string(got[:n]), string(payload))
+	}
+
 	// Poll for the counter to be updated (the worker is asynchronous).
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {

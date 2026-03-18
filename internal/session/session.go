@@ -219,6 +219,33 @@ func (t *Table) Count() int64 {
 	return t.count.Load()
 }
 
+// FindMostRecentClientByBackend returns the most recently touched client address
+// for the given frontend/backend pair.
+func (t *Table) FindMostRecentClientByBackend(frontendName, backendAddr string) (netip.AddrPort, bool) {
+	var (
+		bestAddr netip.AddrPort
+		bestSeen int64
+		found    bool
+	)
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.RLock()
+		for key, sess := range s.entries {
+			if key.FrontendName != frontendName || sess.BackendAddr() != backendAddr {
+				continue
+			}
+			lastSeen := sess.LastSeen.Load()
+			if !found || lastSeen > bestSeen {
+				bestSeen = lastSeen
+				bestAddr = key.Addr
+				found = true
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return bestAddr, found
+}
+
 // reaper runs at cleanupInterval and evicts expired sessions.
 func (t *Table) reaper() {
 	ticker := time.NewTicker(t.cleanupInterval)

@@ -199,6 +199,8 @@ func (f *Frontend) Start(workerCount int, socketCfg config.SocketConfig) error {
 		f.wg.Add(1)
 		go f.forwardWorker()
 	}
+	f.wg.Add(1)
+	go f.backendReadLoop()
 
 	// Start reader goroutines. If there are multiple listener sockets (SO_REUSEPORT),
 	// each reader is pinned to its own socket; otherwise all readers share one socket.
@@ -374,11 +376,15 @@ func (f *Frontend) forward(p pkt) {
 	key := session.Key{Addr: p.clientAddr, FrontendName: f.cfg.Name}
 	payload := (*p.bufPtr)[:p.n]
 
-	var srv *backend.Server
+	var (
+		srv  *backend.Server
+		sess *session.Session
+	)
 
 	if f.cfg.SessionAffinity {
 		clientIP := p.clientAddr.Addr().String()
-		sess, created := f.sessions.GetOrCreate(key, func() *session.Session {
+		var created bool
+		sess, created = f.sessions.GetOrCreate(key, func() *session.Session {
 			s, err := f.pool.Pick(clientIP)
 			if err != nil {
 				return nil
@@ -427,6 +433,20 @@ func (f *Frontend) forward(p pkt) {
 			f.log.Warn("no healthy backend", "frontend", f.cfg.Name, "err", err)
 			return
 		}
+
+		var created bool
+		sess, created = f.sessions.GetOrCreate(key, func() *session.Session {
+			return session.NewSession(srv.Address)
+		})
+		if sess == nil {
+			f.counters.PacketsDropped.Add(1)
+			return
+		}
+		if !created && sess.BackendAddr() != srv.Address {
+			// Keep reverse-path mapping up-to-date for non-affinity mode.
+			sess.UpdateServer(srv.Address, nil)
+		}
+		sess.Touch(int64(p.n))
 	}
 
 	// Use WriteToUDPAddrPort for a zero-allocation send path.
@@ -444,6 +464,51 @@ func (f *Frontend) forward(p pkt) {
 
 	f.counters.PacketsForwarded.Add(1)
 	f.counters.BytesOut.Add(int64(p.n))
+}
+
+// backendReadLoop receives backend responses on the shared outbound socket and
+// forwards them back to the most recently active client mapped to that backend.
+func (f *Frontend) backendReadLoop() {
+	defer f.wg.Done()
+	for {
+		select {
+		case <-f.stopCh:
+			return
+		default:
+		}
+
+		bufPtr := f.bufPool.Get().(*[]byte)
+		buf := *bufPtr
+
+		n, backendAddr, err := f.sendConn.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			f.bufPool.Put(bufPtr)
+			select {
+			case <-f.stopCh:
+				return
+			default:
+				f.log.Debug("backend read error", "frontend", f.cfg.Name, "err", err)
+				continue
+			}
+		}
+
+		srv := f.pool.ServerByAddrPort(backendAddr)
+		if srv == nil {
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
+		clientAddr, ok := f.sessions.FindMostRecentClientByBackend(f.cfg.Name, srv.Address)
+		if !ok {
+			f.bufPool.Put(bufPtr)
+			continue
+		}
+
+		if _, err := f.listenConns[0].WriteToUDPAddrPort(buf[:n], clientAddr); err != nil {
+			f.log.Debug("client send error", "frontend", f.cfg.Name, "client", clientAddr, "err", err)
+		}
+		f.bufPool.Put(bufPtr)
+	}
 }
 
 func (f *Frontend) allowShaped(clientAddr netip.AddrPort, packetSize int, now time.Time) bool {
