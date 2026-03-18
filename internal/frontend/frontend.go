@@ -539,6 +539,7 @@ func (f *Frontend) backendReadLoop() {
 
 		route, ok := f.dequeuePendingRoute(srv.Address)
 		if !ok {
+			f.counters.PacketsDropped.Add(1)
 			f.log.Debug("dropping backend response with no pending client route",
 				"frontend", f.cfg.Name,
 				"backend", srv.Address)
