@@ -11,6 +11,8 @@ import (
 // numShards is the number of independent map shards. Must be a power of 2.
 const numShards = 256
 
+const connIndexUninitialized = int32(-1)
+
 // Key uniquely identifies a client session per frontend.
 // Using netip.AddrPort avoids heap allocations for the client address.
 type Key struct {
@@ -41,6 +43,11 @@ type Session struct {
 	// PacketCount and ByteCount are updated with atomic.Add on every packet.
 	PacketCount atomic.Int64
 	ByteCount   atomic.Int64
+
+	// ConnIndex stores the frontend listener socket index this client most
+	// recently used. It is used for routing response packets through the same
+	// listener path in environments behind L4 load balancers/NAT.
+	ConnIndex atomic.Int32
 }
 
 // NewSession creates a Session targeting backendAddr.
@@ -48,6 +55,7 @@ func NewSession(backendAddr string) *Session {
 	s := &Session{}
 	s.binding.Store(&serverBinding{addr: backendAddr})
 	s.LastSeen.Store(time.Now().UnixNano())
+	s.ConnIndex.Store(connIndexUninitialized)
 	return s
 }
 
@@ -71,6 +79,11 @@ func (s *Session) Touch(bytes int64) {
 	s.LastSeen.Store(time.Now().UnixNano())
 	s.PacketCount.Add(1)
 	s.ByteCount.Add(bytes)
+}
+
+// SetConnIndex records the listener socket index for response routing.
+func (s *Session) SetConnIndex(idx int32) {
+	s.ConnIndex.Store(idx)
 }
 
 // callEvict invokes the eviction callback registered via UpdateServer.
@@ -217,6 +230,35 @@ func (t *Table) Len() int {
 // Count returns the number of active sessions as int64.
 func (t *Table) Count() int64 {
 	return t.count.Load()
+}
+
+// FindMostRecentClientByBackend returns the most recently touched client address
+// for the given frontend/backend pair.
+func (t *Table) FindMostRecentClientByBackend(frontendName, backendAddr string) (Key, int, bool) {
+	var (
+		bestKey  Key
+		bestConn int
+		bestSeen int64
+		found    bool
+	)
+	for i := range t.shards {
+		s := &t.shards[i]
+		s.mu.RLock()
+		for key, sess := range s.entries {
+			if key.FrontendName != frontendName || sess.BackendAddr() != backendAddr {
+				continue
+			}
+			lastSeen := sess.LastSeen.Load()
+			if !found || lastSeen > bestSeen {
+				bestSeen = lastSeen
+				bestKey = key
+				bestConn = int(sess.ConnIndex.Load())
+				found = true
+			}
+		}
+		s.mu.RUnlock()
+	}
+	return bestKey, bestConn, found
 }
 
 // reaper runs at cleanupInterval and evicts expired sessions.

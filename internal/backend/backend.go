@@ -109,6 +109,19 @@ func (p *Pool) ServerByAddr(addr string) *Server {
 	return p.serverMap[addr]
 }
 
+// ServerByAddrPort returns the server with the given resolved address, or nil.
+func (p *Pool) ServerByAddrPort(addr netip.AddrPort) *Server {
+	// Normalize IPv4-mapped IPv6 addresses so inbound UDP source addresses from
+	// dual-stack sockets match the canonical backend addresses stored in the pool.
+	addr = netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
+	for _, s := range p.servers {
+		if s.addrPort == addr {
+			return s
+		}
+	}
+	return nil
+}
+
 // Pick selects a server using the configured algorithm.
 // It iterates p.servers directly (no slice allocation) and skips unhealthy
 // entries inline, keeping the hot path allocation-free.
