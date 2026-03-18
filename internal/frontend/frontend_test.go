@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -210,5 +211,103 @@ func TestFrontendFragmentHandlingNoPayloadFalsePositive(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if counters.PacketsDroppedFragment.Load() != 0 {
 		t.Fatal("expected no fragment drops for normal UDP payload data")
+	}
+}
+
+func TestFrontendRoutesResponsesToMatchingClientRequests(t *testing.T) {
+	backendConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("backend listen: %v", err)
+	}
+	defer backendConn.Close()
+
+	type backendRequest struct {
+		payload []byte
+		addr    *net.UDPAddr
+	}
+	reqCh := make(chan backendRequest, 2)
+	var backendWG sync.WaitGroup
+	backendWG.Add(1)
+	go func() {
+		defer backendWG.Done()
+		buf := make([]byte, 65535)
+		for i := 0; i < 2; i++ {
+			n, addr, readErr := backendConn.ReadFromUDP(buf)
+			if readErr != nil {
+				return
+			}
+			reqCh <- backendRequest{
+				payload: append([]byte(nil), buf[:n]...),
+				addr:    addr,
+			}
+		}
+	}()
+
+	fe, _ := newTestFrontend(t, "127.0.0.1:0", backendConn.LocalAddr().String())
+	if err := fe.Start(1, config.SocketConfig{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer fe.Stop()
+
+	client1, err := net.Dial("udp", fe.Addr())
+	if err != nil {
+		t.Fatalf("client1 dial: %v", err)
+	}
+	defer client1.Close()
+	client2, err := net.Dial("udp", fe.Addr())
+	if err != nil {
+		t.Fatalf("client2 dial: %v", err)
+	}
+	defer client2.Close()
+
+	if _, err := client1.Write([]byte("client-one")); err != nil {
+		t.Fatalf("client1 write: %v", err)
+	}
+	if _, err := client2.Write([]byte("client-two")); err != nil {
+		t.Fatalf("client2 write: %v", err)
+	}
+
+	var first, second backendRequest
+	select {
+	case first = <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first backend request")
+	}
+	select {
+	case second = <-reqCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second backend request")
+	}
+	backendWG.Wait()
+
+	if _, err := backendConn.WriteToUDP([]byte("reply-"+string(first.payload)), first.addr); err != nil {
+		t.Fatalf("backend write first reply: %v", err)
+	}
+	if _, err := backendConn.WriteToUDP([]byte("reply-"+string(second.payload)), second.addr); err != nil {
+		t.Fatalf("backend write second reply: %v", err)
+	}
+
+	if err := client1.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("client1 SetReadDeadline: %v", err)
+	}
+	got1 := make([]byte, 128)
+	n1, err := client1.Read(got1)
+	if err != nil {
+		t.Fatalf("client1 read: %v", err)
+	}
+	if string(got1[:n1]) != "reply-client-one" {
+		t.Fatalf("client1 reply = %q, want %q", string(got1[:n1]), "reply-client-one")
+	}
+
+	if err := client2.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("client2 SetReadDeadline: %v", err)
+	}
+	got2 := make([]byte, 128)
+	n2, err := client2.Read(got2)
+	if err != nil {
+		t.Fatalf("client2 read: %v", err)
+	}
+	if string(got2[:n2]) != "reply-client-two" {
+		t.Fatalf("client2 reply = %q, want %q", string(got2[:n2]), "reply-client-two")
 	}
 }

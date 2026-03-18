@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/abuse"
@@ -23,6 +24,15 @@ import (
 // messages (including IP_RECVFRAGSIZE) returned by recvmsg.
 const fragmentOOBBufferSize = 128
 
+const (
+	// pendingRouteTTL bounds how long an unanswered backend request can keep a
+	// response route entry before it is expired.
+	pendingRouteTTL = 30 * time.Second
+	// maxPendingRoutesPerBackend bounds per-backend memory usage for response
+	// route tracking.
+	maxPendingRoutesPerBackend = 1024
+)
+
 // pkt is a forwarding work item passed from reader goroutines to forwarding workers.
 // The bufPtr field is owned by the work item until the worker returns it to the pool.
 type pkt struct {
@@ -30,6 +40,13 @@ type pkt struct {
 	bufPtr     *[]byte        // buffer from sync.Pool; returned after send
 	n          int            // number of valid bytes in *bufPtr
 	connIndex  int            // listener socket index the packet arrived on
+}
+
+type pendingRoute struct {
+	id         uint64
+	clientAddr netip.AddrPort
+	connIndex  int
+	queuedAt   time.Time
 }
 
 // Frontend listens on a UDP port and proxies packets to a backend pool.
@@ -67,6 +84,10 @@ type Frontend struct {
 	abuseProtector *abuse.Protector
 	dropFragments  bool
 	fragmentAware  bool
+
+	pendingRoutesMu sync.Mutex
+	pendingRoutes   map[string][]pendingRoute
+	pendingRouteSeq atomic.Uint64
 }
 
 // RuntimeOptions configures packet policy for a frontend.
@@ -106,6 +127,7 @@ func New(
 		clientShaper:   opts.ClientShaper,
 		abuseProtector: opts.AbuseProtector,
 		dropFragments:  opts.DropFragments,
+		pendingRoutes:  make(map[string][]pendingRoute),
 	}
 	f.bufPool = sync.Pool{
 		New: func() any {
@@ -452,14 +474,25 @@ func (f *Frontend) forward(p pkt) {
 	}
 	sess.SetConnIndex(int32(p.connIndex))
 
+	routeID, enqueued := f.enqueuePendingRoute(srv.Address, p.clientAddr, p.connIndex, time.Now())
+	if !enqueued {
+		f.counters.PacketsDropped.Add(1)
+		f.log.Debug("dropping packet due to full pending response queue",
+			"frontend", f.cfg.Name,
+			"backend", srv.Address)
+		return
+	}
+
 	// Use WriteToUDPAddrPort for a zero-allocation send path.
 	if f.backendShaper != nil && !f.backendShaper.Allow(p.n, time.Now()) {
+		f.cancelPendingRoute(srv.Address, routeID, time.Now())
 		f.counters.PacketsDropped.Add(1)
 		f.counters.PacketsShaped.Add(1)
 		f.counters.PacketsDroppedRateLimit.Add(1)
 		return
 	}
 	if _, err := f.sendConn.WriteToUDPAddrPort(payload, srv.AddrPort()); err != nil {
+		f.cancelPendingRoute(srv.Address, routeID, time.Now())
 		f.counters.PacketsDropped.Add(1)
 		f.log.Debug("send error", "frontend", f.cfg.Name, "backend", srv.Address, "err", err)
 		return
@@ -470,7 +503,7 @@ func (f *Frontend) forward(p pkt) {
 }
 
 // backendReadLoop receives backend responses on the shared outbound socket and
-// forwards them back to the most recently active client mapped to that backend.
+// forwards them to the oldest pending client route queued for that backend.
 func (f *Frontend) backendReadLoop() {
 	defer f.wg.Done()
 	for {
@@ -504,27 +537,98 @@ func (f *Frontend) backendReadLoop() {
 			continue
 		}
 
-		clientKey, connIndex, ok := f.sessions.FindMostRecentClientByBackend(f.cfg.Name, srv.Address)
+		route, ok := f.dequeuePendingRoute(srv.Address)
 		if !ok {
-			f.log.Debug("dropping backend response with no matching client session",
+			f.log.Debug("dropping backend response with no pending client route",
 				"frontend", f.cfg.Name,
 				"backend", srv.Address)
 			f.bufPool.Put(bufPtr)
 			continue
 		}
+		clientAddr := route.clientAddr
+		connIndex := route.connIndex
 		conn := f.listenerForIndex(connIndex)
 		if conn == nil {
-			conn = f.listenerForClient(clientKey.Addr)
+			conn = f.listenerForClient(clientAddr)
 		}
 		if conn == nil {
 			f.bufPool.Put(bufPtr)
 			continue
 		}
-		if _, err := conn.WriteToUDPAddrPort(buf[:n], clientKey.Addr); err != nil {
-			f.log.Debug("client send error", "frontend", f.cfg.Name, "client", clientKey.Addr, "err", err)
+		if _, err := conn.WriteToUDPAddrPort(buf[:n], clientAddr); err != nil {
+			f.log.Debug("client send error", "frontend", f.cfg.Name, "client", clientAddr, "err", err)
 		}
 		f.bufPool.Put(bufPtr)
 	}
+}
+
+func (f *Frontend) enqueuePendingRoute(backendAddr string, clientAddr netip.AddrPort, connIndex int, now time.Time) (uint64, bool) {
+	f.pendingRoutesMu.Lock()
+	defer f.pendingRoutesMu.Unlock()
+
+	queue := pruneExpiredRoutes(f.pendingRoutes[backendAddr], now)
+	if len(queue) >= maxPendingRoutesPerBackend {
+		f.pendingRoutes[backendAddr] = queue
+		return 0, false
+	}
+	id := f.pendingRouteSeq.Add(1)
+	queue = append(queue, pendingRoute{
+		id:         id,
+		clientAddr: clientAddr,
+		connIndex:  connIndex,
+		queuedAt:   now,
+	})
+	f.pendingRoutes[backendAddr] = queue
+	return id, true
+}
+
+func (f *Frontend) cancelPendingRoute(backendAddr string, routeID uint64, now time.Time) {
+	f.pendingRoutesMu.Lock()
+	defer f.pendingRoutesMu.Unlock()
+
+	queue := pruneExpiredRoutes(f.pendingRoutes[backendAddr], now)
+	for i, route := range queue {
+		if route.id == routeID {
+			queue = append(queue[:i], queue[i+1:]...)
+			break
+		}
+	}
+	if len(queue) == 0 {
+		delete(f.pendingRoutes, backendAddr)
+		return
+	}
+	f.pendingRoutes[backendAddr] = queue
+}
+
+func (f *Frontend) dequeuePendingRoute(backendAddr string) (pendingRoute, bool) {
+	f.pendingRoutesMu.Lock()
+	defer f.pendingRoutesMu.Unlock()
+
+	queue := pruneExpiredRoutes(f.pendingRoutes[backendAddr], time.Now())
+	if len(queue) == 0 {
+		delete(f.pendingRoutes, backendAddr)
+		return pendingRoute{}, false
+	}
+	route := queue[0]
+	queue = queue[1:]
+	if len(queue) == 0 {
+		delete(f.pendingRoutes, backendAddr)
+	} else {
+		f.pendingRoutes[backendAddr] = queue
+	}
+	return route, true
+}
+
+func pruneExpiredRoutes(queue []pendingRoute, now time.Time) []pendingRoute {
+	cutoff := now.Add(-pendingRouteTTL)
+	firstValid := 0
+	for firstValid < len(queue) && queue[firstValid].queuedAt.Before(cutoff) {
+		firstValid++
+	}
+	if firstValid == 0 {
+		return queue
+	}
+	return queue[firstValid:]
 }
 
 // listenerForIndex returns the listener socket for connIndex, or nil if the
