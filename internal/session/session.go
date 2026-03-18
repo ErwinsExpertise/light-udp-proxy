@@ -11,6 +11,8 @@ import (
 // numShards is the number of independent map shards. Must be a power of 2.
 const numShards = 256
 
+const connIndexUninitialized = int32(-1)
+
 // Key uniquely identifies a client session per frontend.
 // Using netip.AddrPort avoids heap allocations for the client address.
 type Key struct {
@@ -53,7 +55,7 @@ func NewSession(backendAddr string) *Session {
 	s := &Session{}
 	s.binding.Store(&serverBinding{addr: backendAddr})
 	s.LastSeen.Store(time.Now().UnixNano())
-	s.ConnIndex.Store(-1)
+	s.ConnIndex.Store(connIndexUninitialized)
 	return s
 }
 

@@ -436,15 +436,15 @@ func (f *Frontend) forward(p pkt) {
 			return
 		}
 
-		var created bool
-		sess, created = f.sessions.GetOrCreate(key, func() *session.Session {
+		var createdNonAffinity bool
+		sess, createdNonAffinity = f.sessions.GetOrCreate(key, func() *session.Session {
 			return session.NewSession(srv.Address)
 		})
 		if sess == nil {
 			f.counters.PacketsDropped.Add(1)
 			return
 		}
-		if !created && sess.BackendAddr() != srv.Address {
+		if !createdNonAffinity && sess.BackendAddr() != srv.Address {
 			// Keep reverse-path mapping up-to-date for non-affinity mode.
 			sess.UpdateServer(srv.Address, nil)
 		}
@@ -527,6 +527,8 @@ func (f *Frontend) backendReadLoop() {
 	}
 }
 
+// listenerForIndex returns the listener socket for connIndex, or nil if the
+// index is outside the current listener socket slice bounds.
 func (f *Frontend) listenerForIndex(connIndex int) *net.UDPConn {
 	if connIndex < 0 || connIndex >= len(f.listenConns) {
 		return nil
