@@ -5,11 +5,18 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/backend"
 	"github.com/ErwinsExpertise/light-udp-proxy/internal/config"
 )
+
+// probePayload is the small L4 UDP probe sent to each backend.
+// If the backend implements RFC 862 UDP echo it will reply with the same bytes,
+// confirming L4 reachability. Most services do not implement echo and will not
+// reply; a read-timeout after a successful write still counts as healthy.
+var probePayload = []byte{0x00, 0x00, 0x00, 0x01}
 
 // Checker runs periodic health checks for a backend pool.
 type Checker struct {
@@ -24,10 +31,15 @@ func New(pool *backend.Pool, cfg config.HealthCheckConfig, log *slog.Logger) *Ch
 }
 
 // Run starts the health checking loop; it blocks until ctx is cancelled.
+// An initial check is performed immediately so backends are probed before the
+// first interval fires, preventing stale healthy-by-default state at startup.
 func (c *Checker) Run(ctx context.Context) {
 	if !c.cfg.Enabled {
 		return
 	}
+	// Probe all servers immediately on start.
+	c.checkAll()
+
 	ticker := time.NewTicker(c.cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -40,16 +52,33 @@ func (c *Checker) Run(ctx context.Context) {
 	}
 }
 
+// checkAll probes every server in the pool concurrently and updates their
+// health status. Running probes in parallel prevents a single timed-out server
+// from delaying the checks of the remaining servers.
 func (c *Checker) checkAll() {
-	for _, srv := range c.pool.Servers() {
-		healthy := c.probe(srv.Address)
-		c.pool.SetHealthy(srv.Address, healthy)
+	servers := c.pool.Servers()
+	var wg sync.WaitGroup
+	wg.Add(len(servers))
+	for _, srv := range servers {
+		srv := srv
+		go func() {
+			defer wg.Done()
+			healthy := c.probe(srv.Address)
+			c.pool.SetHealthy(srv.Address, healthy)
+		}()
 	}
+	wg.Wait()
 }
 
-// probe attempts a UDP dial-and-write to addr.
-// Since UDP is connectionless, we verify reachability by attempting a zero-byte
-// send; absence of an ICMP port-unreachable within the timeout counts as healthy.
+// probe performs an L4 UDP echo health check against addr.
+//
+// A small probe payload is sent and the code waits up to the configured timeout
+// for any response. The outcome is interpreted as follows:
+//   - Response received: the backend echoed the payload — L4 echo confirmed, healthy.
+//   - Read deadline exceeded: the port is reachable but the service does not
+//     implement echo (normal for most UDP services) — healthy.
+//   - Non-timeout error (e.g. ICMP port-unreachable): the backend is not
+//     reachable at the network/transport layer — unhealthy.
 func (c *Checker) probe(addr string) bool {
 	conn, err := net.DialTimeout("udp", addr, c.cfg.Timeout)
 	if err != nil {
@@ -59,25 +88,29 @@ func (c *Checker) probe(addr string) bool {
 	defer conn.Close()
 
 	if err := conn.SetDeadline(time.Now().Add(c.cfg.Timeout)); err != nil {
+		c.log.Debug("health check failed to set connection deadline", "addr", addr, "err", err)
 		return false
 	}
-	// Send a zero-byte payload.
-	if _, err := conn.Write([]byte{}); err != nil {
+
+	// Send the L4 probe payload.
+	if _, err := conn.Write(probePayload); err != nil {
 		c.log.Debug("health check write failed", "addr", addr, "err", err)
 		return false
 	}
-	// Try a read with short timeout; ICMP unreachable surfaces as an error.
-	buf := make([]byte, 1)
-	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)) //nolint:errcheck
+
+	// Wait for an echo response within the configured timeout.
+	// An ICMP port-unreachable or similar error surfaces here as a non-timeout
+	// error, indicating the backend is not reachable.
+	buf := make([]byte, len(probePayload))
 	_, err = conn.Read(buf)
-	// A timeout is fine (no response expected from most services).
-	// An error that is NOT a timeout means the port is unreachable.
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return true
-		}
-		c.log.Debug("health check read error", "addr", addr, "err", err)
-		return false
+	if err == nil {
+		// The backend replied — L4 echo confirmed.
+		return true
 	}
-	return true
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		// Read timed out: the port is reachable but the service doesn't echo.
+		return true
+	}
+	c.log.Debug("health check probe error", "addr", addr, "err", err)
+	return false
 }
