@@ -99,7 +99,7 @@ func TestProbeEchoServer(t *testing.T) {
 
 	p := newTestPool(t, addr)
 	c := newChecker(p)
-	if !c.probe(addr) {
+	if !c.probe(context.Background(), addr) {
 		t.Error("expected probe to return true for echo server")
 	}
 }
@@ -112,7 +112,7 @@ func TestProbeSilentServer(t *testing.T) {
 
 	p := newTestPool(t, addr)
 	c := newChecker(p)
-	if !c.probe(addr) {
+	if !c.probe(context.Background(), addr) {
 		t.Error("expected probe to return true for silent-but-reachable server")
 	}
 }
@@ -130,20 +130,20 @@ func TestProbeUnreachableServer(t *testing.T) {
 
 	p := newTestPool(t, addr)
 	c := newChecker(p)
-	result := c.probe(addr)
+	result := c.probe(context.Background(), addr)
 	// On Linux the kernel delivers ICMP port-unreachable synchronously, so this
-	// should return false. On some platforms/CI environments this may not be
-	// reliable, so only assert if we get the expected false — skip rather than
-	// fail if we get true (silent environment).
+	// should return false. On some platforms/CI environments ICMP may be filtered,
+	// making it impossible to distinguish "closed" from "silent". Skip rather
+	// than fail when the environment doesn't deliver ICMP.
 	if result {
-		t.Log("probe returned true for closed port — ICMP may be filtered in this environment; skipping assertion")
-	} else {
-		t.Log("probe correctly returned false for closed port")
+		t.Skip("probe returned true for closed port — ICMP may be filtered in this environment")
 	}
+	t.Log("probe correctly returned false for closed port")
 }
 
-// TestCheckAllUpdatesHealth verifies that checkAll marks a server healthy when
-// it is reachable and unhealthy when it is not.
+// TestCheckAllUpdatesHealth verifies that checkAll flips a server from unhealthy
+// to healthy when it is reachable, confirming that the health state is actually
+// updated rather than left at the pool's default-healthy initial value.
 func TestCheckAllUpdatesHealth(t *testing.T) {
 	addr, stop := startSilentUDPServer(t)
 	defer stop()
@@ -151,14 +151,20 @@ func TestCheckAllUpdatesHealth(t *testing.T) {
 	p := newTestPool(t, addr)
 	c := newChecker(p)
 
-	// Server starts healthy; checkAll should keep it healthy.
-	c.checkAll()
+	// Mark the server unhealthy so we can confirm checkAll flips it back to healthy.
+	p.SetHealthy(addr, false)
 	srv := p.ServerByAddr(addr)
 	if srv == nil {
 		t.Fatal("server not found in pool")
 	}
+	if srv.Healthy.Load() {
+		t.Fatal("precondition failed: server should be unhealthy before checkAll")
+	}
+
+	c.checkAll(context.Background())
+
 	if !srv.Healthy.Load() {
-		t.Error("expected server to remain healthy after checkAll with live server")
+		t.Error("expected checkAll to mark reachable server healthy")
 	}
 }
 
@@ -169,6 +175,9 @@ func TestRunPerformsInitialCheck(t *testing.T) {
 	defer stop()
 
 	p := newTestPool(t, addr)
+	// Mark the server unhealthy so we can confirm the initial check flips it.
+	p.SetHealthy(addr, false)
+
 	// Use a very long interval so any check that fires must be the initial one.
 	checker := New(p, config.HealthCheckConfig{
 		Enabled:  true,
@@ -177,23 +186,31 @@ func TestRunPerformsInitialCheck(t *testing.T) {
 	}, slog.Default())
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		checker.Run(ctx)
-	}()
+	defer cancel()
 
-	// Give the initial check time to complete.
-	time.Sleep(500 * time.Millisecond)
-	cancel()
-	<-done
+	go checker.Run(ctx)
 
 	srv := p.ServerByAddr(addr)
 	if srv == nil {
 		t.Fatal("server not found in pool")
 	}
-	if !srv.Healthy.Load() {
-		t.Error("expected initial check to mark server healthy")
+
+	// Poll until the server is marked healthy or we time out, rather than
+	// relying on a fixed Sleep that may be racy or pass trivially.
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if srv.Healthy.Load() {
+				return // initial check succeeded
+			}
+		case <-timeout.C:
+			t.Error("initial check did not mark server healthy within 2s deadline")
+			return
+		}
 	}
 }
 
